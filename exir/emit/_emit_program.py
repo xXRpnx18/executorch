@@ -21,7 +21,34 @@ from executorch.exir.error import ExportError, ExportErrorType
 from executorch.exir.schema import Buffer, Program, SubsegmentOffsets
 from executorch.exir.version import EXECUTORCH_SCHEMA_VERSION
 from torch.export.exported_program import ExportedProgram, OutputKind
+from torch.export.graph_signature import OutputSpec
 from torch.utils import _pytree as pytree
+
+
+def _is_mutation_output_stripped_from_return(spec: OutputSpec) -> bool:
+    """Return True if this output is listed in the signature but not in the method return tuple.
+
+    ``_remove_non_user_outputs`` strips these; training prim indices must match that tuple.
+    """
+
+    return spec.kind in (
+        OutputKind.BUFFER_MUTATION,
+        OutputKind.USER_INPUT_MUTATION,
+    )
+
+
+def _output_specs_visible_in_return(exported_program: ExportedProgram) -> List[OutputSpec]:
+    """``output_specs`` entries whose values appear in the lowered method return tuple.
+
+    Must stay aligned with ``_remove_non_user_outputs`` (same predicate as
+    ``_is_mutation_output_stripped_from_return``).
+    """
+
+    return [
+        s
+        for s in exported_program.graph_signature.output_specs
+        if not _is_mutation_output_stripped_from_return(s)
+    ]
 
 
 @dataclass
@@ -65,7 +92,7 @@ def _remove_non_user_outputs(exported_program: ExportedProgram) -> torch.fx.Grap
     output_node = gm.graph.output_node()
 
     mutated_outputs: List[Optional[str]] = [
-        out_spec.target if out_spec.kind in (OutputKind.BUFFER_MUTATION,) else None
+        out_spec.target if _is_mutation_output_stripped_from_return(out_spec) else None
         for out_spec in exported_program.graph_signature.output_specs
     ]
     outputs = pytree.tree_flatten(output_node.args)[0]
@@ -89,29 +116,50 @@ def _remove_non_user_outputs(exported_program: ExportedProgram) -> torch.fx.Grap
 # For each entry point in the model, determine if its a joint graph,
 # and if it is return a map of the indices in the model output that the
 # gradient outputs start at and that the parameter outputs start at.
-def _get_training_metadata(methods: Dict[str, ExportedProgram]) -> Dict[str, int]:
+def _get_training_metadata(methods: Dict[str, ExportedProgram]) -> Dict[str, Any]:
+    """Compute indices into the **emitted** method return tuple.
+
+    ``_remove_non_user_outputs`` drops ``OutputKind.BUFFER_MUTATION`` and
+    ``OutputKind.USER_INPUT_MUTATION`` entries from the graph ``return`` while
+    ``graph_signature.output_specs`` still lists every output.
+    Training prim getters must use the same **visible-output** indexing as
+    ``TrainingModule::execute`` (``grad_start`` / ``param_start``), otherwise
+    ``param_start - grad_start`` can disagree with the true gradient tensor count
+    (e.g. 47 vs 48 for YOLO11 QAT joint).
+
+    Implementation: index only ``_output_specs_visible_in_return`` (same filter as the
+    removed return slots), so ``enumerate(visible)`` matches emitted tuple positions
+    without a manual ``emit_index`` that can drift if another kind is added later.
+    """
     gradients_method_prefix = "__et_training_gradients_index_"
     parameters_method_prefix = "__et_training_parameters_index_"
     fqn_method_prefix = "__et_training_fqn_"
-    training_metadata = {}
+    training_metadata: Dict[str, Any] = {}
     for name, method in methods.items():
+        visible = _output_specs_visible_in_return(method)
         found_grad = False
         found_param = False
-        fqns = []
-        i = 0
-        for output_spec in method.graph_signature.output_specs:
-            if output_spec.kind == OutputKind.GRADIENT_TO_PARAMETER:
+        fqns: List[str] = []
+        for emit_index, output_spec in enumerate(visible):
+            # After int8 weight export (compress_to_int8), weight grad outputs are
+            # GRADIENT_TO_USER_INPUT, not GRADIENT_TO_PARAMETER — include both so
+            # __et_training_fqn has one entry per gradient slot (matches C++ SGD
+            # + manual int8 buffer updates that key gradients by state_dict name).
+            if output_spec.kind in (
+                OutputKind.GRADIENT_TO_PARAMETER,
+                OutputKind.GRADIENT_TO_USER_INPUT,
+            ):
                 if not found_grad:
-                    training_metadata[gradients_method_prefix + name] = i
+                    training_metadata[gradients_method_prefix + name] = emit_index
                     found_grad = True
+                assert isinstance(output_spec.target, str)
                 fqns.append(output_spec.target)
             elif output_spec.kind == OutputKind.TOKEN and not found_param:
                 assert found_grad  # Params must come after gradients
-                training_metadata[parameters_method_prefix + name] = i
+                training_metadata[parameters_method_prefix + name] = emit_index
                 found_param = True
-            i += 1
-            if len(fqns) > 0:
-                training_metadata[fqn_method_prefix + name] = fqns
+        if fqns:
+            training_metadata[fqn_method_prefix + name] = fqns
     return training_metadata
 
 

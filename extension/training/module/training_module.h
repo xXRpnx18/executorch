@@ -54,6 +54,7 @@ class ET_EXPERIMENTAL TrainingModule final
     method_named_gradients_.erase(method_name);
     method_named_parameters_.erase(method_name);
     method_named_attributes_.erase(method_name);
+    method_grad_fqn_storage_.erase(method_name);
 
     return methods_.erase(method_name);
   }
@@ -130,6 +131,10 @@ class ET_EXPERIMENTAL TrainingModule final
       std::string,
       std::map<std::string_view, executorch::aten::Tensor>>
       method_named_attributes_;
+
+  // Owns FQN strings for gradient keys when the emitter only lists bias names but
+  // the graph emits weight+bias grad blocks (int8 weight → GRADIENT_TO_USER_INPUT).
+  std::unordered_map<std::string, std::vector<std::string>> method_grad_fqn_storage_;
 };
 
 } // namespace training
