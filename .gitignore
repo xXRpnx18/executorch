@@ -19,6 +19,7 @@ cmake-out-android/
 build-android/
 build-x86/
 build-hexagon/
+build_release/
 dist/
 arm-scratch/
 executorch.egg-info
