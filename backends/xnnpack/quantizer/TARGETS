@@ -20,3 +20,11 @@ runtime.python_library(
         "//executorch/backends/xnnpack/utils:xnnpack_utils",
     ],
 )
+
+runtime.python_library(
+    name = "xnnpack_joint_training_quantizer",
+    srcs = ["xnnpack_joint_training_quantizer.py"],
+    deps = [
+        "//caffe2:torch",
+    ],
+)

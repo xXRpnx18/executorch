@@ -8,6 +8,7 @@
 
 #include <executorch/kernels/portable/cpu/util/kernel_ops_util.h>
 #include <executorch/runtime/kernel/kernel_includes.h>
+#include <cstring>
 
 namespace torch {
 namespace executor {
@@ -172,6 +173,7 @@ Tensor& max_pool2d_with_indices_backward_out(
   static constexpr auto name = "max_pool2d_with_indices_backward.grad_input";
 
   ET_SWITCH_FLOATHBF16_TYPES(input.scalar_type(), ctx, name, CTYPE, [&]() {
+    std::memset(grad_input.mutable_data_ptr<CTYPE>(), 0, grad_input.nbytes());
     max_pool_backward_impl<CTYPE, false>(grad_input, grad_output, indices);
   });
 
