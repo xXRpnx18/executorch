@@ -9,11 +9,18 @@ from typing import Any, Callable, Optional, Set, TYPE_CHECKING
 import torch
 import torch._dynamo as torchdynamo
 import torch.nn.functional as F
-from executorch.backends.xnnpack.quantizer.xnnpack_quantizer_utils import (
-    _convert_scalars_to_attrs,
-    OP_TO_ANNOTATOR,
-    propagate_annotation,
-)
+try:
+    from .xnnpack_quantizer_utils import (
+        _convert_scalars_to_attrs,
+        OP_TO_ANNOTATOR,
+        propagate_annotation,
+    )
+except ImportError:
+    from xnnpack_quantizer_utils import (
+        _convert_scalars_to_attrs,
+        OP_TO_ANNOTATOR,
+        propagate_annotation,
+    )
 from torchao.quantization.pt2e import (
     FakeQuantize,
     FusedMovingAvgObsFakeQuantize,

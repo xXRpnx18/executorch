@@ -4,7 +4,7 @@ from __future__ import annotations
 import operator
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 from torch._subclasses import FakeTensor
@@ -25,6 +25,7 @@ from torchao.quantization.pt2e.quantizer import (
 )
 from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 from torchao.quantization.pt2e.utils import _fuse_conv_bn_
+from xnnpack_quantizer import XNNPACKQuantizer, get_symmetric_quantization_config
 
 
 __all__ = [
@@ -69,6 +70,7 @@ _VIEW_LIKE_TARGETS = {
 }
 
 _METADATA_ONLY_FACTORY_TARGETS = {
+    torch.ops.aten._assert_tensor_metadata.default,
     torch.ops.aten.empty_like.default,
     torch.ops.aten.full_like.default,
     torch.ops.aten.new_empty.default,
@@ -351,6 +353,99 @@ def _is_decomposed_silu_internal_edge(input_node: Node, consumer_node: Node) -> 
     return source is not None and _is_sigmoid_of(input_node, source)
 
 
+def _node_contains_target(
+    node: object,
+    target: object,
+    *,
+    max_depth: int = 8,
+    seen: set[Node] | None = None,
+) -> bool:
+    if not isinstance(node, Node) or max_depth < 0:
+        return False
+    if node.op == "call_function" and node.target == target:
+        return True
+    seen = seen or set()
+    if node in seen:
+        return False
+    seen.add(node)
+    return any(
+        _node_contains_target(arg, target, max_depth=max_depth - 1, seen=seen)
+        for arg in _iter_node_args(node.args)
+    )
+
+
+def _is_plain_silu_derivative(node: object) -> bool:
+    return (
+        isinstance(node, Node)
+        and _node_contains_target(node, torch.ops.aten.sigmoid.default)
+        and _node_contains_target(node, torch.ops.aten.add.Scalar)
+        and _node_contains_target(node, torch.ops.aten.sub.Tensor)
+    )
+
+
+def _find_plain_silu_conv_backward_edges(gm: GraphModule) -> list[tuple[Node, Node, Node]]:
+    edges: list[tuple[Node, Node, Node]] = []
+    for conv_backward in gm.graph.nodes:
+        if (
+            conv_backward.op != "call_function"
+            or conv_backward.target != torch.ops.aten.convolution_backward.default
+            or not conv_backward.args
+        ):
+            continue
+        silu_grad = conv_backward.args[0]
+        if (
+            not isinstance(silu_grad, Node)
+            or silu_grad.op != "call_function"
+            or silu_grad.target != torch.ops.aten.mul.Tensor
+            or len(silu_grad.args) < 2
+        ):
+            continue
+        node_args = [arg for arg in silu_grad.args[:2] if isinstance(arg, Node)]
+        if len(node_args) != 2:
+            continue
+        lhs, rhs = node_args
+        if _is_plain_silu_derivative(lhs):
+            edges.append((silu_grad, rhs, conv_backward))
+        elif _is_plain_silu_derivative(rhs):
+            edges.append((silu_grad, lhs, conv_backward))
+    return edges
+
+
+def _forward_node_names(gm: GraphModule, loss_output_names: set[str]) -> set[str]:
+    names: set[str] = set()
+    in_backward = False
+    for node in gm.graph.nodes:
+        if node.name in loss_output_names:
+            in_backward = True
+        if not in_backward:
+            names.add(node.name)
+    return names
+
+
+def _model_forward_node_names(
+    gm: GraphModule, user_output_names: set[str]
+) -> set[str]:
+    by_name = {node.name: node for node in gm.graph.nodes}
+    stack = [by_name[name] for name in user_output_names if name in by_name]
+    seen: set[Node] = set()
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(_iter_node_args(node.args))
+        stack.extend(_iter_node_args(node.kwargs))
+    return {node.name for node in seen}
+
+
+def _clear_quantization_annotations(
+    gm: GraphModule, keep_fn: Callable[[Node], bool]
+) -> None:
+    for node in gm.graph.nodes:
+        if not keep_fn(node):
+            node.meta.pop(Q_ANNOTATION_KEY, None)
+
+
 class XNNPACKJointTrainingQuantizer(Quantizer):
     """Annotates exported joint forward/backward graphs for XNNPACK Q/DQ training."""
 
@@ -362,8 +457,19 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         gradient_config: QuantizationConfig | None = None,
         weight_config: QuantizationConfig | None = None,
         quantize_final_outputs: bool = False,
+        backward_quantization_mode: str = "all",
+        use_xnnpack_forward_quantizer: bool = True,
+        annotate_silu_edges: bool = True,
+        annotate_pre_silu_edges: bool = True,
+        silu_output_filter_fn: Callable[[Node], bool] | None = None,
+        forward_quantization_config: QuantizationConfig | None = None,
+        forward_filter_fn: Callable[[Node], bool] | None = None,
     ) -> None:
         super().__init__()
+        if backward_quantization_mode not in {"all", "none", "conv_silu"}:
+            raise ValueError(
+                "backward_quantization_mode must be one of {'all', 'none', 'conv_silu'}"
+            )
         self.activation_config = activation_config or get_affine_activation_qdq_config()
         self.pre_silu_activation_config = (
             pre_silu_activation_config or get_symmetric_activation_qdq_config()
@@ -371,7 +477,18 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         self.gradient_config = gradient_config or get_symmetric_gradient_qdq_config()
         self.weight_config = weight_config or get_symmetric_weight_qdq_config()
         self.quantize_final_outputs = quantize_final_outputs
+        self.backward_quantization_mode = backward_quantization_mode
+        self.use_xnnpack_forward_quantizer = use_xnnpack_forward_quantizer
+        self.annotate_silu_edges = annotate_silu_edges
+        self.annotate_pre_silu_edges = annotate_pre_silu_edges
+        self.silu_output_filter_fn = silu_output_filter_fn
+        self.forward_quantization_config = (
+            forward_quantization_config
+            or get_symmetric_quantization_config(is_per_channel=False)
+        )
+        self.forward_filter_fn = forward_filter_fn
         self.loss_output_names: set[str] = set()
+        self.user_output_names: set[str] = set()
         self.final_output_names: set[str] = set()
         self.annotation_report: dict[str, Any] = {}
 
@@ -380,6 +497,11 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             spec.arg.name
             for spec in exported_program.graph_signature.output_specs
             if spec.kind == OutputKind.LOSS_OUTPUT and hasattr(spec.arg, "name")
+        }
+        self.user_output_names = {
+            spec.arg.name
+            for spec in exported_program.graph_signature.output_specs
+            if spec.kind == OutputKind.USER_OUTPUT and hasattr(spec.arg, "name")
         }
         self.final_output_names = {
             spec.arg.name
@@ -392,6 +514,34 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         return model
 
     def annotate(self, model: GraphModule) -> GraphModule:
+        user_forward_node_names = _model_forward_node_names(
+            model, self.user_output_names
+        )
+        loss_forward_node_names = _model_forward_node_names(
+            model, self.loss_output_names
+        )
+        if self.use_xnnpack_forward_quantizer:
+            forward_node_names = user_forward_node_names or _forward_node_names(
+                model, self.loss_output_names
+            )
+            forward_quantizer = XNNPACKQuantizer().set_global(
+                self.forward_quantization_config
+            )
+            forward_quantizer.set_filter_function(
+                lambda node: node.name in forward_node_names
+                and (
+                    self.forward_filter_fn is None or self.forward_filter_fn(node)
+                )
+            )
+            model = forward_quantizer.annotate(model)
+            if self.forward_filter_fn is not None:
+                _clear_quantization_annotations(
+                    model,
+                    lambda node: node.name in forward_node_names
+                    and self.forward_filter_fn is not None
+                    and self.forward_filter_fn(node),
+                )
+
         self.annotation_report = annotate_joint_backward_qdq_edges(
             model,
             activation_qspec=self.activation_config.input_activation,
@@ -402,6 +552,13 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             final_output_names=self.final_output_names
             if self.quantize_final_outputs
             else set(),
+            backward_quantization_mode=self.backward_quantization_mode,
+            annotate_forward_compute_edges=not self.use_xnnpack_forward_quantizer,
+            annotate_silu_edges=self.annotate_silu_edges,
+            annotate_pre_silu_edges=self.annotate_pre_silu_edges,
+            silu_output_filter_fn=self.silu_output_filter_fn,
+            phase_forward_node_names=loss_forward_node_names | user_forward_node_names,
+            loss_only_node_names=loss_forward_node_names - user_forward_node_names,
         )
         return model
 
@@ -421,23 +578,46 @@ def annotate_joint_backward_qdq_edges(
     weight_qspec: QuantizationSpec,
     loss_output_names: set[str],
     final_output_names: set[str],
+    backward_quantization_mode: str = "all",
+    annotate_forward_compute_edges: bool = True,
+    annotate_silu_edges: bool = True,
+    annotate_pre_silu_edges: bool = True,
+    silu_output_filter_fn: Callable[[Node], bool] | None = None,
+    phase_forward_node_names: set[str] | None = None,
+    loss_only_node_names: set[str] | None = None,
 ) -> dict[str, Any]:
-    pre_silu_sources, silu_outputs, silu_internal_sigmoids = _find_silu_qdq_nodes(gm)
+    if annotate_silu_edges:
+        pre_silu_sources, silu_outputs, silu_internal_sigmoids = _find_silu_qdq_nodes(gm)
+        if silu_output_filter_fn is not None:
+            silu_outputs = {node for node in silu_outputs if silu_output_filter_fn(node)}
+        if not annotate_pre_silu_edges:
+            pre_silu_sources = set()
+            silu_internal_sigmoids = set()
+    else:
+        pre_silu_sources, silu_outputs, silu_internal_sigmoids = set(), set(), set()
     producer_output_qspec_nodes = pre_silu_sources | silu_outputs
 
     input_edges = 0
-    output_nodes = 0
+    requested_output_qdq_nodes: set[Node] = set()
     annotated_nodes = 0
     skipped_view_like_consumers = 0
-    in_backward = False
     by_phase = {"forward": 0, "backward": 0}
-    forward_value_nodes: set[Node] = set()
+    conv_silu_backward_edges = 0
+    forward_value_nodes: set[Node] = {
+        node
+        for node in gm.graph.nodes
+        if phase_forward_node_names is not None and node.name in phase_forward_node_names
+    }
+    in_backward = False
 
     for node in gm.graph.nodes:
         if node.op not in {"call_function", "call_method"}:
             continue
-        if node.name in loss_output_names:
-            in_backward = True
+        if phase_forward_node_names is None:
+            if node.name in loss_output_names:
+                in_backward = True
+        else:
+            in_backward = node.name not in phase_forward_node_names
         phase = "backward" if in_backward else "forward"
 
         output_qspec = None
@@ -447,16 +627,33 @@ def annotate_joint_backward_qdq_edges(
             output_qspec = activation_qspec
         elif node.name in final_output_names and _is_float_tensor_node(node):
             output_qspec = gradient_qspec if in_backward else activation_qspec
+        if output_qspec is not None:
+            requested_output_qdq_nodes.add(node)
 
         if not _is_compute_consumer(node) and output_qspec is None:
             skipped_view_like_consumers += int(_is_view_like_node(node))
-            if not in_backward:
+            if phase_forward_node_names is None and not in_backward:
                 forward_value_nodes.add(node)
             continue
 
         input_qspec_map: dict[Node, QuantizationSpec] = {}
         if _is_compute_consumer(node):
             for input_node in _iter_node_args(node.args):
+                if node.kwargs:
+                    continue
+                if in_backward and backward_quantization_mode == "none":
+                    continue
+                if in_backward and backward_quantization_mode == "conv_silu":
+                    continue
+                if not in_backward and not annotate_forward_compute_edges:
+                    continue
+                if in_backward:
+                    origin = _origin_node(input_node)
+                    if input_node.name in loss_output_names or (
+                        loss_only_node_names is not None
+                        and origin.name in loss_only_node_names
+                    ):
+                        continue
                 if _is_metadata_only_factory_node(node):
                     continue
                 if not _is_quantizable_input_node(input_node):
@@ -491,21 +688,41 @@ def annotate_joint_backward_qdq_edges(
         ):
             annotated_nodes += 1
             input_edges += len(input_qspec_map)
-            output_nodes += int(output_qspec is not None)
             by_phase[phase] += 1
-        if not in_backward:
+        if phase_forward_node_names is None and not in_backward:
             forward_value_nodes.add(node)
+
+    if backward_quantization_mode == "conv_silu":
+        for silu_grad, gradient_input, conv_backward in _find_plain_silu_conv_backward_edges(gm):
+            if _merge_quantization_annotation(
+                silu_grad,
+                input_qspec_map={gradient_input: activation_qspec},
+                allow_implicit_sharing=False,
+            ):
+                annotated_nodes += 1
+                input_edges += 1
+                by_phase["backward"] += 1
+            if _merge_quantization_annotation(
+                conv_backward,
+                input_qspec_map={silu_grad: gradient_qspec},
+                allow_implicit_sharing=False,
+            ):
+                annotated_nodes += 1
+                input_edges += 1
+                by_phase["backward"] += 1
+            conv_silu_backward_edges += 1
 
     return {
         "joint_qdq_annotated_nodes": annotated_nodes,
         "joint_qdq_input_edges": input_edges,
-        "joint_qdq_output_nodes": output_nodes,
+        "joint_qdq_output_nodes": len(requested_output_qdq_nodes),
         "joint_qdq_forward_nodes": by_phase["forward"],
         "joint_qdq_backward_nodes": by_phase["backward"],
         "joint_qdq_skipped_view_like_consumers": skipped_view_like_consumers,
         "joint_qdq_pre_silu_sources": len(pre_silu_sources),
         "joint_qdq_silu_outputs": len(silu_outputs),
         "joint_qdq_silu_internal_sigmoids": len(silu_internal_sigmoids),
+        "joint_qdq_conv_silu_backward_edges": conv_silu_backward_edges,
     }
 
 
@@ -583,6 +800,48 @@ def _is_sigmoid_of_dequantize_from(node: object, quantize_node: Node) -> bool:
     )
 
 
+def _is_alias_of(node: object, source: Node) -> bool:
+    if node is source:
+        return True
+    if not isinstance(node, Node):
+        return False
+    quantize_node = _dequantize_quantize_node(node)
+    if quantize_node is not None:
+        qdq_source = _quantize_source(quantize_node)
+        return qdq_source is not None and _is_alias_of(qdq_source, source)
+    if node.op == "call_function" and node.target == torch.ops.aten.clone.default:
+        return bool(node.args and _is_alias_of(node.args[0], source))
+    return False
+
+
+def _contains_sigmoid_of_alias(
+    node: object,
+    source: Node,
+    *,
+    max_depth: int = 8,
+    seen: set[Node] | None = None,
+) -> bool:
+    if not isinstance(node, Node) or max_depth < 0:
+        return False
+    if (
+        node.op == "call_function"
+        and node.target == torch.ops.aten.sigmoid.default
+        and node.args
+        and _is_alias_of(node.args[0], source)
+    ):
+        return True
+    seen = seen or set()
+    if node in seen:
+        return False
+    seen.add(node)
+    return any(
+        _contains_sigmoid_of_alias(
+            arg, source, max_depth=max_depth - 1, seen=seen
+        )
+        for arg in _iter_node_args(node.args)
+    )
+
+
 def _is_converted_decomposed_silu_node(node: Node, quantize_node: Node) -> bool:
     if (
         node.op != "call_function"
@@ -590,13 +849,16 @@ def _is_converted_decomposed_silu_node(node: Node, quantize_node: Node) -> bool:
         or len(node.args) < 2
     ):
         return False
+    qdq_source = _quantize_source(quantize_node)
+    if qdq_source is None:
+        return False
     lhs, rhs = node.args[:2]
     return (
-        _is_dequantize_of_quantize(lhs, quantize_node)
-        and _is_sigmoid_of_dequantize_from(rhs, quantize_node)
+        _is_alias_of(lhs, qdq_source)
+        and _contains_sigmoid_of_alias(rhs, qdq_source)
     ) or (
-        _is_dequantize_of_quantize(rhs, quantize_node)
-        and _is_sigmoid_of_dequantize_from(lhs, quantize_node)
+        _is_alias_of(rhs, qdq_source)
+        and _contains_sigmoid_of_alias(lhs, qdq_source)
     )
 
 
@@ -625,10 +887,16 @@ def _contains_sigmoid_of_dequantize_from(
 
 def _is_silu_derivative_arg(node: Node, quantize_node: Node) -> bool:
     source = _unwrap_qdq_source(node)
+    qdq_source = _quantize_source(quantize_node)
+    if qdq_source is None:
+        return False
     return (
         source.op == "call_function"
         and source.target == torch.ops.aten.mul.Tensor
-        and _contains_sigmoid_of_dequantize_from(source, quantize_node)
+        and (
+            _contains_sigmoid_of_dequantize_from(source, quantize_node)
+            or _contains_sigmoid_of_alias(source, qdq_source)
+        )
     )
 
 
@@ -701,6 +969,14 @@ def _find_silu_backward_grads(gm: GraphModule, qsym_quantize: Node) -> list[tupl
         ):
             continue
         node_args = [arg for arg in node.args[:2] if isinstance(arg, Node)]
+        if any(
+            arg.op == "call_function"
+            and arg.target == torch.ops.aten._to_copy.default
+            and isinstance(arg.args[0], Node)
+            and arg.args[0].target == torch.ops.aten.logical_and.default
+            for arg in node_args
+        ):
+            continue
         for derivative_arg in node_args:
             if not _is_silu_derivative_arg(derivative_arg, qsym_quantize):
                 continue
@@ -755,7 +1031,15 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
                 for user in _direct_quantize_users(silu_grad)
                 if _is_symmetric_qdq_quantize(user)
             ]
-            if not silu_grad_quantize_users:
+            conv_backward_users = [
+                user
+                for user in silu_grad.users
+                if user.op == "call_function"
+                and user.target == torch.ops.aten.convolution_backward.default
+                and user.args
+                and user.args[0] is silu_grad
+            ]
+            if not silu_grad_quantize_users and not conv_backward_users:
                 continue
 
             qasym_mask = _insert_ste_mask(
@@ -771,7 +1055,11 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
             if _replace_node_arg(silu_grad, gradient_input, masked_gradient):
                 qasym_masks += 1
 
-            qsym_mask_insert_before = silu_grad_quantize_users[0]
+            qsym_mask_insert_before = (
+                silu_grad_quantize_users[0]
+                if silu_grad_quantize_users
+                else conv_backward_users[0]
+            )
             qsym_mask = _insert_ste_mask(
                 gm,
                 source_node=qsym_source,
@@ -784,8 +1072,11 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
                 )
             for quantize_user in silu_grad_quantize_users:
                 quantize_user.args = (masked_silu_grad, *quantize_user.args[1:])
-            qsym_masks += 1
-            matched_backward += 1
+            for conv_backward in conv_backward_users:
+                _replace_node_arg(conv_backward, silu_grad, masked_silu_grad)
+            if silu_grad_quantize_users or conv_backward_users:
+                qsym_masks += 1
+                matched_backward += 1
 
     gm.graph.eliminate_dead_code()
     gm.recompile()

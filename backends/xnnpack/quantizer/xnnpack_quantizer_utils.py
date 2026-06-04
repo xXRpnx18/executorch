@@ -1,13 +1,9 @@
 # mypy: allow-untyped-defs
 import itertools
-from typing import Callable, Optional
+from typing import Callable, cast, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from executorch.backends.xnnpack.utils.utils import (
-    get_groups_from_conv,
-    is_depthwise_conv,
-)
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
@@ -36,6 +32,38 @@ from torchao.quantization.pt2e.utils import (
     _is_conv_transpose_node,
     get_new_attr_name_with_prefix,
 )
+
+
+def get_groups_from_conv(conv_node: torch.fx.Node) -> int:
+    if _is_conv_node(conv_node):
+        in_node = cast(torch.fx.Node, conv_node.args[0])
+        weight_node = cast(torch.fx.Node, conv_node.args[1])
+        in_channels = in_node.meta["val"].shape[1]
+        in_groups = weight_node.meta["val"].shape[1]
+        return in_channels // in_groups
+    if _is_conv_transpose_node(conv_node):
+        weight_node = cast(torch.fx.Node, conv_node.args[1])
+        out_groups = weight_node.meta["val"].shape[1]
+        out_channels = conv_node.meta["val"].shape[1]
+        return out_channels // out_groups
+    raise RuntimeError(f"expected {conv_node} to be a conv or conv_transpose node")
+
+
+def is_depthwise_conv(
+    kernel_shape: Tuple[int, ...], groups: int = 1, is_transpose: bool = False
+) -> bool:
+    if len(kernel_shape) < 2 or groups < 1:
+        return False
+    if is_transpose:
+        group_input_channels = int(kernel_shape[0] / groups)
+        group_output_channels = kernel_shape[1]
+    else:
+        group_input_channels = kernel_shape[1]
+        group_output_channels = int(kernel_shape[0] / groups)
+    return (
+        group_input_channels == 1 and group_output_channels % group_input_channels == 0
+    )
+
 
 __all__ = [
     "OperatorConfig",
