@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import operator
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -96,6 +97,51 @@ _CONV_TARGETS = {
 _SILU_TARGETS = {
     torch.ops.aten.silu.default,
 }
+
+_LAYERWISE_EDGE_KINDS = {
+    "forward_activation",
+    "forward_pre_silu",
+    "forward_silu_output",
+    "backward_saved_activation",
+    "backward_silu_input",
+    "backward_gradient",
+    "backward_conv_input",
+    "final_forward_output",
+    "final_backward_output",
+}
+
+_LAYERWISE_FORWARD_EDGE_KINDS = {
+    "forward_activation",
+    "forward_pre_silu",
+    "forward_silu_output",
+    "final_forward_output",
+}
+
+_LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS = {"forward_pre_silu"}
+
+_LAYERWISE_AFFINE_ACTIVATION_EDGE_KINDS = {
+    "forward_activation",
+    "forward_silu_output",
+    "backward_saved_activation",
+    "backward_silu_input",
+    "final_forward_output",
+}
+
+_LAYERWISE_GRADIENT_EDGE_KINDS = {
+    "backward_gradient",
+    "backward_conv_input",
+    "final_backward_output",
+}
+
+
+def _as_string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [str(item) for item in value]
+    return [str(value)]
 
 
 def _fake_tensor(node: Node) -> FakeTensor | None:
@@ -496,6 +542,250 @@ def _clear_quantization_annotations(
             node.meta.pop(Q_ANNOTATION_KEY, None)
 
 
+def _node_module_stack_strings(node: Node) -> tuple[list[str], list[str]]:
+    module_paths: list[str] = []
+    module_types: list[str] = []
+    nn_module_stack = node.meta.get("nn_module_stack")
+    if isinstance(nn_module_stack, dict):
+        for key, value in nn_module_stack.items():
+            module_paths.append(str(key))
+            if isinstance(value, (tuple, list)):
+                if value:
+                    module_paths.append(str(value[0]))
+                if len(value) > 1:
+                    module_type = value[1]
+                    module_types.append(getattr(module_type, "__name__", str(module_type)))
+            else:
+                module_paths.append(str(value))
+    target = str(node.target if node.target is not None else node.name)
+    if target.startswith(("p_", "b_")):
+        module_paths.append(target)
+        module_paths.append(target[2:])
+        module_paths.append(target[2:].replace("_", "."))
+    return module_paths, module_types
+
+
+def _collect_related_nodes(
+    nodes: Iterable[Node],
+    *,
+    max_depth: int = 3,
+) -> list[Node]:
+    related: list[Node] = []
+    seen: set[Node] = set()
+    stack: list[tuple[Node, int]] = [(node, 0) for node in nodes]
+    while stack:
+        node, depth = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        related.append(node)
+        if depth >= max_depth:
+            continue
+        for arg in _iter_node_args(node.args):
+            stack.append((arg, depth + 1))
+        for arg in _iter_node_args(node.kwargs):
+            stack.append((arg, depth + 1))
+    return related
+
+
+def _node_match_strings(node: Node) -> dict[str, list[str]]:
+    module_paths, module_types = _node_module_stack_strings(node)
+    target = str(node.target if node.target is not None else node.name)
+    fields = {
+        "name": [node.name],
+        "target": [target],
+        "module": module_paths,
+        "type": module_types,
+    }
+    fields["any"] = [
+        text
+        for values in fields.values()
+        for text in values
+        if text
+    ]
+    return fields
+
+
+def _normalize_layerwise_edge_formats(section: object) -> dict[str, str]:
+    if section is None:
+        return {}
+    if isinstance(section, str):
+        section = {"format": section}
+    if not isinstance(section, dict):
+        raise TypeError("layer quantization config entries must be strings or objects")
+
+    formats: dict[str, str] = {}
+    default_format = section.get("format")
+    forward_format = section.get("forward", default_format)
+    backward_format = section.get("backward", default_format)
+    for edge_kind in _LAYERWISE_EDGE_KINDS:
+        phase_format = (
+            forward_format
+            if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS
+            else backward_format
+        )
+        if phase_format is not None:
+            formats[edge_kind] = str(phase_format)
+
+    edge_overrides = section.get("edges", {})
+    if not isinstance(edge_overrides, dict):
+        raise TypeError("layer quantization config 'edges' must be an object")
+    for edge_kind, quant_format in edge_overrides.items():
+        if edge_kind not in _LAYERWISE_EDGE_KINDS:
+            raise ValueError(f"unsupported layer quantization edge kind: {edge_kind}")
+        formats[str(edge_kind)] = str(quant_format)
+
+    for edge_kind in _LAYERWISE_EDGE_KINDS:
+        if edge_kind in section:
+            formats[edge_kind] = str(section[edge_kind])
+
+    for quant_format in formats.values():
+        if quant_format not in {"int8", "int16"}:
+            raise ValueError(
+                "layer quantization format must be 'int8' or 'int16', "
+                f"got {quant_format!r}"
+            )
+    return formats
+
+
+class _LayerWiseQuantRule:
+    def __init__(self, index: int, raw_rule: dict[str, Any]) -> None:
+        self.index = index
+        self.name = str(raw_rule.get("name", f"rule_{index}"))
+        match = raw_rule.get("match", {})
+        if not isinstance(match, dict):
+            raise TypeError("layer quantization rule 'match' must be an object")
+        self.matchers: dict[str, list[re.Pattern[str]]] = {}
+        for raw_key, raw_patterns in match.items():
+            key = str(raw_key)
+            if key.endswith("_regex"):
+                key = key[: -len("_regex")]
+            if key == "scope":
+                key = "module"
+            if key not in {"name", "target", "module", "type", "any"}:
+                raise ValueError(f"unsupported layer quantization match key: {raw_key}")
+            patterns = [
+                re.compile(pattern)
+                for pattern in _as_string_list(raw_patterns)
+            ]
+            self.matchers[key] = patterns
+        if not self.matchers:
+            raise ValueError("layer quantization rule must contain at least one matcher")
+        self.edge_formats = _normalize_layerwise_edge_formats(raw_rule)
+
+    def matches(self, nodes: Iterable[Node], *, max_depth: int = 3) -> bool:
+        field_values: dict[str, list[str]] = {
+            "name": [],
+            "target": [],
+            "module": [],
+            "type": [],
+            "any": [],
+        }
+        for node in _collect_related_nodes(nodes, max_depth=max_depth):
+            for key, values in _node_match_strings(node).items():
+                field_values[key].extend(values)
+
+        for key, patterns in self.matchers.items():
+            values = field_values[key]
+            if not all(
+                any(pattern.search(value) for value in values)
+                for pattern in patterns
+            ):
+                return False
+        return True
+
+    def format_for(self, edge_kind: str) -> str | None:
+        return self.edge_formats.get(edge_kind)
+
+
+class _LayerWiseQuantFormatResolver:
+    def __init__(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise TypeError("layer quantization config must be a JSON object")
+        self.default_formats = _normalize_layerwise_edge_formats(
+            config.get("default", {})
+        )
+        rules = config.get("rules", [])
+        if not isinstance(rules, list):
+            raise TypeError("layer quantization config 'rules' must be a list")
+        self.rules = [
+            _LayerWiseQuantRule(index, rule)
+            for index, rule in enumerate(rules)
+            if isinstance(rule, dict)
+        ]
+        if len(self.rules) != len(rules):
+            raise TypeError("layer quantization rules must be objects")
+        self._activation_qspecs = {
+            "int8": get_affine_activation_qdq_config().input_activation,
+            "int16": get_affine_activation_int16_qdq_config().input_activation,
+        }
+        self._pre_silu_qspecs = {
+            "int8": get_symmetric_activation_qdq_config().input_activation,
+            "int16": get_symmetric_activation_int16_qdq_config().input_activation,
+        }
+        self._gradient_qspecs = {
+            "int8": get_symmetric_gradient_qdq_config().input_activation,
+            "int16": get_symmetric_gradient_int16_qdq_config().input_activation,
+        }
+        self.reset_report()
+
+    def reset_report(self) -> None:
+        self.format_counts: dict[str, dict[str, int]] = {}
+        self.rule_counts: dict[str, int] = {}
+
+    def _qspec_for_format(
+        self,
+        edge_kind: str,
+        quant_format: str,
+    ) -> QuantizationSpec:
+        if edge_kind in _LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS:
+            return self._pre_silu_qspecs[quant_format]
+        if edge_kind in _LAYERWISE_AFFINE_ACTIVATION_EDGE_KINDS:
+            return self._activation_qspecs[quant_format]
+        if edge_kind in _LAYERWISE_GRADIENT_EDGE_KINDS:
+            return self._gradient_qspecs[quant_format]
+        raise ValueError(f"unsupported layer quantization edge kind: {edge_kind}")
+
+    def __call__(
+        self,
+        edge_kind: str,
+        fallback_qspec: QuantizationSpec,
+        nodes: tuple[Node, ...],
+    ) -> QuantizationSpec:
+        if edge_kind not in _LAYERWISE_EDGE_KINDS:
+            raise ValueError(f"unsupported layer quantization edge kind: {edge_kind}")
+        quant_format = self.default_formats.get(edge_kind)
+        matched_rule_name: str | None = None
+        match_depth = 1 if edge_kind in {
+            "backward_silu_input",
+            "backward_conv_input",
+        } else 3
+        for rule in self.rules:
+            if not rule.matches(nodes, max_depth=match_depth):
+                continue
+            rule_format = rule.format_for(edge_kind)
+            if rule_format is not None:
+                quant_format = rule_format
+                matched_rule_name = rule.name
+        if quant_format is None:
+            return fallback_qspec
+
+        edge_counts = self.format_counts.setdefault(edge_kind, {})
+        edge_counts[quant_format] = edge_counts.get(quant_format, 0) + 1
+        if matched_rule_name is not None:
+            self.rule_counts[matched_rule_name] = (
+                self.rule_counts.get(matched_rule_name, 0) + 1
+            )
+        return self._qspec_for_format(edge_kind, quant_format)
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "format_counts": self.format_counts,
+            "rule_match_counts": self.rule_counts,
+        }
+
+
 class XNNPACKJointTrainingQuantizer(Quantizer):
     """Annotates exported joint forward/backward graphs for XNNPACK Q/DQ training."""
 
@@ -514,6 +804,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         silu_output_filter_fn: Callable[[Node], bool] | None = None,
         forward_quantization_config: QuantizationConfig | None = None,
         forward_filter_fn: Callable[[Node], bool] | None = None,
+        layer_quantization_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if backward_quantization_mode not in {"all", "none", "conv_silu"}:
@@ -537,6 +828,11 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             or get_symmetric_quantization_config(is_per_channel=False)
         )
         self.forward_filter_fn = forward_filter_fn
+        self.layer_quantization_resolver = (
+            _LayerWiseQuantFormatResolver(layer_quantization_config)
+            if layer_quantization_config is not None
+            else None
+        )
         self.loss_output_names: set[str] = set()
         self.user_output_names: set[str] = set()
         self.final_output_names: set[str] = set()
@@ -592,6 +888,9 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
                     and self.forward_filter_fn(node),
                 )
 
+        if self.layer_quantization_resolver is not None:
+            self.layer_quantization_resolver.reset_report()
+
         self.annotation_report = annotate_joint_backward_qdq_edges(
             model,
             activation_qspec=self.activation_config.input_activation,
@@ -609,7 +908,12 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             silu_output_filter_fn=self.silu_output_filter_fn,
             phase_forward_node_names=loss_forward_node_names | user_forward_node_names,
             loss_only_node_names=loss_forward_node_names - user_forward_node_names,
+            qspec_resolver=self.layer_quantization_resolver,
         )
+        if self.layer_quantization_resolver is not None:
+            self.annotation_report["joint_qdq_layerwise_config"] = (
+                self.layer_quantization_resolver.report()
+            )
         return model
 
     def validate(self, model: GraphModule) -> None:
@@ -635,7 +939,20 @@ def annotate_joint_backward_qdq_edges(
     silu_output_filter_fn: Callable[[Node], bool] | None = None,
     phase_forward_node_names: set[str] | None = None,
     loss_only_node_names: set[str] | None = None,
+    qspec_resolver: Callable[
+        [str, QuantizationSpec, tuple[Node, ...]], QuantizationSpec
+    ]
+    | None = None,
 ) -> dict[str, Any]:
+    def resolve_qspec(
+        edge_kind: str,
+        fallback_qspec: QuantizationSpec,
+        *nodes: Node,
+    ) -> QuantizationSpec:
+        if qspec_resolver is None:
+            return fallback_qspec
+        return qspec_resolver(edge_kind, fallback_qspec, tuple(nodes))
+
     if annotate_silu_edges:
         pre_silu_sources, silu_outputs, silu_internal_sigmoids = _find_silu_qdq_nodes(gm)
         if silu_output_filter_fn is not None:
@@ -672,11 +989,22 @@ def annotate_joint_backward_qdq_edges(
 
         output_qspec = None
         if node in pre_silu_sources and _is_float_tensor_node(node):
-            output_qspec = pre_silu_activation_qspec
+            output_qspec = resolve_qspec(
+                "forward_pre_silu", pre_silu_activation_qspec, node
+            )
         elif node in silu_outputs and _is_float_tensor_node(node):
-            output_qspec = activation_qspec
+            output_qspec = resolve_qspec(
+                "forward_silu_output", activation_qspec, node
+            )
         elif node.name in final_output_names and _is_float_tensor_node(node):
-            output_qspec = gradient_qspec if in_backward else activation_qspec
+            if in_backward:
+                output_qspec = resolve_qspec(
+                    "final_backward_output", gradient_qspec, node
+                )
+            else:
+                output_qspec = resolve_qspec(
+                    "final_forward_output", activation_qspec, node
+                )
         if output_qspec is not None:
             requested_output_qdq_nodes.add(node)
 
@@ -721,10 +1049,23 @@ def annotate_joint_backward_qdq_edges(
                     origin in forward_value_nodes
                     or _is_user_activation_placeholder(origin)
                 ):
-                    input_qspec_map[input_node] = activation_qspec
+                    input_qspec_map[input_node] = resolve_qspec(
+                        "backward_saved_activation",
+                        activation_qspec,
+                        node,
+                        input_node,
+                        origin,
+                    )
                 else:
-                    input_qspec_map[input_node] = (
-                        gradient_qspec if in_backward else activation_qspec
+                    edge_kind = (
+                        "backward_gradient" if in_backward else "forward_activation"
+                    )
+                    input_qspec_map[input_node] = resolve_qspec(
+                        edge_kind,
+                        gradient_qspec if in_backward else activation_qspec,
+                        node,
+                        input_node,
+                        origin,
                     )
 
         if not input_qspec_map and output_qspec is None:
@@ -746,7 +1087,15 @@ def annotate_joint_backward_qdq_edges(
         for silu_grad, gradient_input, conv_backward in _find_plain_silu_conv_backward_edges(gm):
             if _merge_quantization_annotation(
                 silu_grad,
-                input_qspec_map={gradient_input: activation_qspec},
+                input_qspec_map={
+                    gradient_input: resolve_qspec(
+                        "backward_silu_input",
+                        activation_qspec,
+                        silu_grad,
+                        gradient_input,
+                        conv_backward,
+                    )
+                },
                 allow_implicit_sharing=False,
             ):
                 annotated_nodes += 1
@@ -754,7 +1103,15 @@ def annotate_joint_backward_qdq_edges(
                 by_phase["backward"] += 1
             if _merge_quantization_annotation(
                 conv_backward,
-                input_qspec_map={silu_grad: gradient_qspec},
+                input_qspec_map={
+                    silu_grad: resolve_qspec(
+                        "backward_conv_input",
+                        gradient_qspec,
+                        conv_backward,
+                        silu_grad,
+                        gradient_input,
+                    )
+                },
                 allow_implicit_sharing=False,
             ):
                 annotated_nodes += 1
