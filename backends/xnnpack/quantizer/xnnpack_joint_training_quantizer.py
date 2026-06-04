@@ -32,8 +32,11 @@ __all__ = [
     "XNNPACKJointTrainingQuantizer",
     "annotate_joint_backward_qdq_edges",
     "get_affine_activation_qdq_config",
+    "get_affine_activation_int16_qdq_config",
     "get_symmetric_activation_qdq_config",
+    "get_symmetric_activation_int16_qdq_config",
     "get_symmetric_gradient_qdq_config",
+    "get_symmetric_gradient_int16_qdq_config",
     "get_symmetric_weight_qdq_config",
     "insert_joint_qdq_ste_masks",
 ]
@@ -254,6 +257,24 @@ def get_affine_activation_qdq_config(
     return _make_quantization_config(act_quantization_spec, weight_quantization_spec)
 
 
+def get_affine_activation_int16_qdq_config() -> QuantizationConfig:
+    act_quantization_spec = QuantizationSpec(
+        dtype=torch.int16,
+        quant_min=-32768,
+        quant_max=32767,
+        qscheme=torch.per_tensor_affine,
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=1e-12),
+    )
+    weight_quantization_spec = QuantizationSpec(
+        dtype=torch.int8,
+        quant_min=-127,
+        quant_max=127,
+        qscheme=torch.per_tensor_symmetric,
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
+    )
+    return _make_quantization_config(act_quantization_spec, weight_quantization_spec)
+
+
 def get_symmetric_activation_qdq_config() -> QuantizationConfig:
     act_quantization_spec = QuantizationSpec(
         dtype=torch.int8,
@@ -272,6 +293,24 @@ def get_symmetric_activation_qdq_config() -> QuantizationConfig:
     return _make_quantization_config(act_quantization_spec, weight_quantization_spec)
 
 
+def get_symmetric_activation_int16_qdq_config() -> QuantizationConfig:
+    act_quantization_spec = QuantizationSpec(
+        dtype=torch.int16,
+        quant_min=-32767,
+        quant_max=32767,
+        qscheme=torch.per_tensor_symmetric,
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=1e-12),
+    )
+    weight_quantization_spec = QuantizationSpec(
+        dtype=torch.int8,
+        quant_min=-127,
+        quant_max=127,
+        qscheme=torch.per_tensor_symmetric,
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
+    )
+    return _make_quantization_config(act_quantization_spec, weight_quantization_spec)
+
+
 def get_symmetric_gradient_qdq_config() -> QuantizationConfig:
     grad_quantization_spec = QuantizationSpec(
         dtype=torch.int8,
@@ -279,6 +318,17 @@ def get_symmetric_gradient_qdq_config() -> QuantizationConfig:
         quant_max=127,
         qscheme=torch.per_tensor_symmetric,
         observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
+    )
+    return _make_quantization_config(grad_quantization_spec, grad_quantization_spec)
+
+
+def get_symmetric_gradient_int16_qdq_config() -> QuantizationConfig:
+    grad_quantization_spec = QuantizationSpec(
+        dtype=torch.int16,
+        quant_min=-32767,
+        quant_max=32767,
+        qscheme=torch.per_tensor_symmetric,
+        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=1e-12),
     )
     return _make_quantization_config(grad_quantization_spec, grad_quantization_spec)
 
@@ -768,22 +818,20 @@ def _direct_quantize_users(node: Node) -> list[Node]:
 
 
 def _is_symmetric_qdq_quantize(node: Node) -> bool:
-    return (
-        _is_quantize_per_tensor_node(node)
-        and len(node.args) >= 5
-        and node.args[2] == 0
-        and node.args[3] == -127
-        and node.args[4] == 127
-    )
+    if not _is_quantize_per_tensor_node(node) or len(node.args) < 5:
+        return False
+    zero_point = int(node.args[2])
+    quant_min = int(node.args[3])
+    quant_max = int(node.args[4])
+    return zero_point == 0 and quant_min in {-127, -32767} and -quant_min == quant_max
 
 
 def _is_affine_qdq_quantize(node: Node) -> bool:
-    return (
-        _is_quantize_per_tensor_node(node)
-        and len(node.args) >= 5
-        and node.args[3] == -128
-        and node.args[4] == 127
-    )
+    if not _is_quantize_per_tensor_node(node) or len(node.args) < 5:
+        return False
+    quant_min = int(node.args[3])
+    quant_max = int(node.args[4])
+    return (quant_min, quant_max) in {(-128, 127), (-32768, 32767)}
 
 
 def _is_dequantize_of_quantize(node: object, quantize_node: Node) -> bool:
@@ -900,6 +948,25 @@ def _is_silu_derivative_arg(node: Node, quantize_node: Node) -> bool:
     )
 
 
+def _node_shape(node: Node) -> tuple[int, ...] | None:
+    source = _unwrap_qdq_source(node)
+    val = source.meta.get("val")
+    if hasattr(val, "shape"):
+        return tuple(val.shape)
+    tensor_meta = source.meta.get("tensor_meta")
+    if hasattr(tensor_meta, "shape"):
+        return tuple(tensor_meta.shape)
+    return None
+
+
+def _same_known_shape(lhs: Node, rhs: Node) -> bool:
+    lhs_shape = _node_shape(lhs)
+    rhs_shape = _node_shape(rhs)
+    if lhs_shape is None or rhs_shape is None:
+        return True
+    return lhs_shape == rhs_shape
+
+
 def _ste_bounds_from_quantize_node(quantize_node: Node) -> tuple[float, float]:
     if len(quantize_node.args) < 5:
         raise RuntimeError(f"unexpected quantize_per_tensor args: {quantize_node.args}")
@@ -961,6 +1028,9 @@ def _find_converted_silu_qdq(gm: GraphModule) -> list[tuple[Node, Node, Node, No
 
 def _find_silu_backward_grads(gm: GraphModule, qsym_quantize: Node) -> list[tuple[Node, Node]]:
     candidates: list[tuple[Node, Node]] = []
+    qsym_source = _quantize_source(qsym_quantize)
+    if qsym_source is None:
+        return candidates
     for node in gm.graph.nodes:
         if (
             node.op != "call_function"
@@ -982,6 +1052,8 @@ def _find_silu_backward_grads(gm: GraphModule, qsym_quantize: Node) -> list[tupl
                 continue
             for gradient_input in node_args:
                 if gradient_input is derivative_arg:
+                    continue
+                if not _same_known_shape(gradient_input, qsym_source):
                     continue
                 candidates.append((node, gradient_input))
     return candidates
