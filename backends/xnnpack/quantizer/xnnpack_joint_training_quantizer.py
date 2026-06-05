@@ -17,7 +17,11 @@ _VENDORED_TORCHAO = _REPO_ROOT / "executorch" / "third-party" / "ao"
 if _VENDORED_TORCHAO.is_dir() and str(_VENDORED_TORCHAO) not in sys.path:
     sys.path.insert(0, str(_VENDORED_TORCHAO))
 
-from torchao.quantization.pt2e import HistogramObserver, MinMaxObserver
+from torchao.quantization.pt2e import (
+    HistogramObserver,
+    MinMaxObserver,
+    PlaceholderObserver,
+)
 from torchao.quantization.pt2e.quantizer import (
     QuantizationAnnotation,
     QuantizationConfig,
@@ -36,6 +40,7 @@ __all__ = [
     "get_affine_activation_int16_qdq_config",
     "get_symmetric_activation_qdq_config",
     "get_symmetric_activation_int16_qdq_config",
+    "get_fp16_activation_qdq_config",
     "get_symmetric_gradient_qdq_config",
     "get_symmetric_gradient_int16_qdq_config",
     "get_symmetric_weight_qdq_config",
@@ -116,6 +121,9 @@ _LAYERWISE_FORWARD_EDGE_KINDS = {
     "forward_silu_output",
     "final_forward_output",
 }
+
+_LAYERWISE_FORWARD_FORMATS = {"int8", "int16"}
+_LAYERWISE_BACKWARD_FORMATS = {"int8", "int16", "fp16"}
 
 _LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS = {"forward_pre_silu"}
 
@@ -357,6 +365,14 @@ def get_symmetric_activation_int16_qdq_config() -> QuantizationConfig:
     return _make_quantization_config(act_quantization_spec, weight_quantization_spec)
 
 
+def get_fp16_activation_qdq_config() -> QuantizationConfig:
+    act_quantization_spec = QuantizationSpec(
+        dtype=torch.float16,
+        observer_or_fake_quant_ctr=PlaceholderObserver.with_args(dtype=torch.float16),
+    )
+    return _make_quantization_config(act_quantization_spec, act_quantization_spec)
+
+
 def get_symmetric_gradient_qdq_config() -> QuantizationConfig:
     grad_quantization_spec = QuantizationSpec(
         dtype=torch.int8,
@@ -473,6 +489,8 @@ def _node_contains_target(
 def _is_plain_silu_derivative(node: object) -> bool:
     return (
         isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target == torch.ops.aten.mul.Tensor
         and _node_contains_target(node, torch.ops.aten.sigmoid.default)
         and _node_contains_target(node, torch.ops.aten.add.Scalar)
         and _node_contains_target(node, torch.ops.aten.sub.Tensor)
@@ -639,11 +657,16 @@ def _normalize_layerwise_edge_formats(section: object) -> dict[str, str]:
         if edge_kind in section:
             formats[edge_kind] = str(section[edge_kind])
 
-    for quant_format in formats.values():
-        if quant_format not in {"int8", "int16"}:
+    for edge_kind, quant_format in formats.items():
+        allowed_formats = (
+            _LAYERWISE_FORWARD_FORMATS
+            if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS
+            else _LAYERWISE_BACKWARD_FORMATS
+        )
+        if quant_format not in allowed_formats:
             raise ValueError(
-                "layer quantization format must be 'int8' or 'int16', "
-                f"got {quant_format!r}"
+                f"layer quantization format for {edge_kind} must be one of "
+                f"{sorted(allowed_formats)}, got {quant_format!r}"
             )
     return formats
 
@@ -727,6 +750,7 @@ class _LayerWiseQuantFormatResolver:
             "int8": get_symmetric_gradient_qdq_config().input_activation,
             "int16": get_symmetric_gradient_int16_qdq_config().input_activation,
         }
+        self._fp16_qspec = get_fp16_activation_qdq_config().input_activation
         self.reset_report()
 
     def reset_report(self) -> None:
@@ -738,6 +762,10 @@ class _LayerWiseQuantFormatResolver:
         edge_kind: str,
         quant_format: str,
     ) -> QuantizationSpec:
+        if quant_format == "fp16":
+            if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS:
+                raise ValueError(f"fp16 is only supported for backward edges: {edge_kind}")
+            return self._fp16_qspec
         if edge_kind in _LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS:
             return self._pre_silu_qspecs[quant_format]
         if edge_kind in _LAYERWISE_AFFINE_ACTIVATION_EDGE_KINDS:
