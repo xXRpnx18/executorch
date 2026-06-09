@@ -51,6 +51,8 @@ __all__ = [
 _QUANTIZE_PER_TENSOR = torch.ops.quantized_decomposed.quantize_per_tensor.default
 _DEQUANTIZE_PER_TENSOR = torch.ops.quantized_decomposed.dequantize_per_tensor.default
 
+_BACKWARD_QUANTIZATION_MODES = {"all", "none", "conv_silu", "annotation_rule"}
+
 _SKIP_PLACEHOLDER_TOKENS = (
     "label",
     "labels",
@@ -76,7 +78,57 @@ _VIEW_LIKE_TARGETS = {
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.slice_copy.Tensor,
     torch.ops.aten.flatten.using_ints,
+    torch.ops.aten.split.Tensor,
+    torch.ops.aten.split_with_sizes.default,
+    torch.ops.aten.split_with_sizes_copy.default,
+    torch.ops.aten.unbind.int,
+    torch.ops.aten.chunk.default,
 }
+
+_LOSS_PATH_TEXT_TOKENS = (
+    "label",
+    "labels",
+    "bbox",
+    "bboxes",
+    "target",
+    "targets",
+    "mask",
+    "masks",
+    "assign",
+    "batch_idx",
+    "gt_",
+)
+
+_LOSS_PATH_TARGETS = {
+    torch.ops.aten.where.self,
+    torch.ops.aten.scatter.value,
+    torch.ops.aten.index_put.default,
+}
+
+_ATTENTION_TEXT_TOKENS = (
+    "_attn_",
+    ".attn.",
+    "attention",
+    "qkv",
+)
+
+_ATTENTION_TARGETS = {
+    torch.ops.aten.bmm.default,
+    torch.ops.aten.matmul.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.softmax.int,
+}
+
+_YOLO_DETECT_INDEX_RE = re.compile(
+    r"^[pcb]_model_model_(\d+)_(?:cv2|cv3|dfl|m_|anchors|strides)(?:_|$)"
+)
+_YOLO_ATTENTION_INDEX_RE = re.compile(
+    r"^[pb]_model_model_(\d+)_.*(?:attn|qkv)"
+)
+_YOLO_MODEL_PARAM_RE = re.compile(r"^[pb]_model_model_\d+_")
+_NAMED_MODEL_PARAM_RE = re.compile(
+    r"^[pb]_(?:backbone|neck|detect|detect_head|head|model)_"
+)
 
 _METADATA_ONLY_FACTORY_TARGETS = {
     torch.ops.aten._assert_tensor_metadata.default,
@@ -103,6 +155,14 @@ _SILU_TARGETS = {
     torch.ops.aten.silu.default,
 }
 
+_ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS = {
+    torch.ops.aten.convolution_backward.default,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.add.Scalar,
+    torch.ops.aten.cat.default,
+    torch.ops.aten.mul.Tensor,
+}
+
 _LAYERWISE_EDGE_KINDS = {
     "forward_activation",
     "forward_pre_silu",
@@ -125,10 +185,9 @@ _LAYERWISE_FORWARD_EDGE_KINDS = {
 _LAYERWISE_FORWARD_FORMATS = {"int8", "int16"}
 _LAYERWISE_BACKWARD_FORMATS = {"int8", "int16", "fp16"}
 
-_LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS = {"forward_pre_silu"}
-
 _LAYERWISE_AFFINE_ACTIVATION_EDGE_KINDS = {
     "forward_activation",
+    "forward_pre_silu",
     "forward_silu_output",
     "backward_saved_activation",
     "backward_silu_input",
@@ -189,7 +248,16 @@ def _is_user_activation_placeholder(node: Node) -> bool:
 
 
 def _is_view_like_node(node: Node) -> bool:
-    return node.op == "call_function" and node.target in _VIEW_LIKE_TARGETS
+    if node.op != "call_function":
+        return False
+    if node.target in _VIEW_LIKE_TARGETS:
+        return True
+    return (
+        node.target is operator.getitem
+        and node.args
+        and isinstance(node.args[0], Node)
+        and _is_view_like_node(node.args[0])
+    )
 
 
 def _origin_node(node: Node) -> Node:
@@ -624,6 +692,257 @@ def _node_match_strings(node: Node) -> dict[str, list[str]]:
     return fields
 
 
+def _lower_match_texts(nodes: Iterable[Node], *, max_depth: int = 3) -> list[str]:
+    return [
+        text.lower()
+        for node in _collect_related_nodes(nodes, max_depth=max_depth)
+        for text in _node_match_strings(node)["any"]
+    ]
+
+
+def _detect_head_model_indices(gm: GraphModule) -> set[str]:
+    indices: set[str] = set()
+    for node in gm.graph.nodes:
+        if node.op not in {"placeholder", "get_attr"}:
+            continue
+        for text in _lower_match_texts((node,), max_depth=0):
+            match = _YOLO_DETECT_INDEX_RE.search(text)
+            if match is not None:
+                indices.add(match.group(1))
+    return indices
+
+
+def _attention_model_indices(gm: GraphModule) -> set[str]:
+    indices: set[str] = set()
+    for node in gm.graph.nodes:
+        if node.op not in {"placeholder", "get_attr"}:
+            continue
+        for text in _lower_match_texts((node,), max_depth=0):
+            match = _YOLO_ATTENTION_INDEX_RE.search(text)
+            if match is not None:
+                indices.add(match.group(1))
+    return indices
+
+
+def _is_loss_path_related(
+    nodes: Iterable[Node],
+    loss_only_node_names: set[str] | None,
+    *,
+    max_depth: int = 3,
+) -> bool:
+    related = _collect_related_nodes(nodes, max_depth=max_depth)
+    if loss_only_node_names is not None and any(
+        node.name in loss_only_node_names for node in related
+    ):
+        return True
+    if any(
+        node.op == "call_function" and node.target in _LOSS_PATH_TARGETS
+        for node in related
+    ):
+        return True
+    for node in related:
+        if node.op != "placeholder":
+            continue
+        if any(
+            token in text
+            for text in _lower_match_texts((node,), max_depth=0)
+            for token in _LOSS_PATH_TEXT_TOKENS
+        ):
+            return True
+    return False
+
+
+def _is_attention_related(
+    nodes: Iterable[Node],
+    *,
+    attention_model_indices: set[str] | None = None,
+    max_depth: int = 3,
+) -> bool:
+    related = _collect_related_nodes(nodes, max_depth=max_depth)
+    if any(
+        node.op == "call_function" and node.target in _ATTENTION_TARGETS
+        for node in related
+    ):
+        return True
+    texts = _lower_match_texts(related, max_depth=0)
+    token_texts = _lower_match_texts(
+        _collect_related_nodes(nodes, max_depth=min(max_depth, 4)),
+        max_depth=0,
+    )
+    if any(
+        token in text
+        for text in token_texts
+        for token in _ATTENTION_TEXT_TOKENS
+    ):
+        return True
+    attention_model_indices = attention_model_indices or set()
+    return any(
+        f"model_model_{index}_" in text
+        for text in texts
+        for index in attention_model_indices
+    )
+
+
+def _is_detect_head_related(text: str, detect_head_indices: set[str]) -> bool:
+    if "detect_head" in text or ".detect." in text or "_detect_" in text:
+        return True
+    return any(f"model_model_{index}_" in text for index in detect_head_indices)
+
+
+def _is_model_parameter_text(text: str) -> bool:
+    return bool(
+        _YOLO_MODEL_PARAM_RE.match(text) or _NAMED_MODEL_PARAM_RE.match(text)
+    )
+
+
+def _is_model_path_related(
+    nodes: Iterable[Node],
+    *,
+    detect_head_indices: set[str],
+    max_depth: int = 4,
+) -> bool:
+    texts = _lower_match_texts(nodes, max_depth=max_depth)
+    if any(_is_detect_head_related(text, detect_head_indices) for text in texts):
+        return True
+    return any(_is_model_parameter_text(text) for text in texts)
+
+
+def _annotation_rule_edge_decision(
+    *,
+    node: Node,
+    input_node: Node,
+    origin: Node,
+    detect_head_indices: set[str],
+    model_backward_node_names: set[str],
+    attention_model_indices: set[str],
+    loss_only_node_names: set[str] | None,
+) -> str:
+    if _is_loss_path_related((node,), loss_only_node_names, max_depth=0):
+        return "skip_loss_path"
+    if _is_loss_path_related(
+        (input_node, origin),
+        loss_only_node_names,
+        max_depth=1,
+    ):
+        return "skip_loss_path"
+    related = (node, input_node, origin)
+    if _is_attention_related(
+        related,
+        attention_model_indices=attention_model_indices,
+        max_depth=4,
+    ):
+        return "skip_attention"
+    if any(
+        item.name in model_backward_node_names for item in (node, input_node, origin)
+    ):
+        return "quantize"
+    if not _is_model_path_related(
+        related,
+        detect_head_indices=detect_head_indices,
+        max_depth=5,
+    ):
+        return "skip_non_model"
+    return "quantize"
+
+
+def _annotation_rule_output_decision(
+    *,
+    node: Node,
+    detect_head_indices: set[str],
+    model_backward_node_names: set[str],
+    attention_model_indices: set[str],
+    loss_only_node_names: set[str] | None,
+) -> str:
+    related = (node,)
+    if _is_loss_path_related(related, loss_only_node_names, max_depth=1):
+        return "skip_loss_path"
+    if _is_attention_related(
+        related,
+        attention_model_indices=attention_model_indices,
+        max_depth=8,
+    ):
+        return "skip_attention"
+    if node.name in model_backward_node_names:
+        return "quantize"
+    if not _is_model_path_related(
+        related,
+        detect_head_indices=detect_head_indices,
+        max_depth=5,
+    ):
+        return "skip_non_model"
+    return "quantize"
+
+
+def _annotation_rule_model_backward_node_names(
+    gm: GraphModule,
+    *,
+    phase_forward_node_names: set[str] | None,
+    loss_output_names: set[str],
+    detect_head_indices: set[str],
+    attention_model_indices: set[str],
+    loss_only_node_names: set[str] | None,
+) -> set[str]:
+    roots: list[Node] = []
+    in_backward = False
+    for node in gm.graph.nodes:
+        if phase_forward_node_names is None:
+            if node.name in loss_output_names:
+                in_backward = True
+        else:
+            in_backward = node.name not in phase_forward_node_names
+        if not in_backward:
+            continue
+        if node.name in loss_output_names:
+            continue
+        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1):
+            continue
+        if _is_attention_related(
+            (node,),
+            attention_model_indices=attention_model_indices,
+            max_depth=4,
+        ):
+            continue
+        if _is_model_path_related(
+            (node,),
+            detect_head_indices=detect_head_indices,
+            max_depth=5,
+        ):
+            roots.append(node)
+
+    seen: set[Node] = set()
+    stack = list(roots)
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        if node.name in loss_output_names:
+            continue
+        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1):
+            continue
+        if _is_attention_related(
+            (node,),
+            attention_model_indices=attention_model_indices,
+            max_depth=4,
+        ):
+            continue
+        seen.add(node)
+        stack.extend(_iter_node_args(node.args))
+        stack.extend(_iter_node_args(node.kwargs))
+    return {node.name for node in seen}
+
+
+def _has_annotation_rule_boundary_consumer(
+    node: Node,
+    model_backward_node_names: set[str],
+) -> bool:
+    return any(
+        user.name in model_backward_node_names
+        and user.op == "call_function"
+        and user.target in _ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS
+        for user in node.users
+    )
+
+
 def _normalize_layerwise_edge_formats(section: object) -> dict[str, str]:
     if section is None:
         return {}
@@ -742,10 +1061,6 @@ class _LayerWiseQuantFormatResolver:
             "int8": get_affine_activation_qdq_config().input_activation,
             "int16": get_affine_activation_int16_qdq_config().input_activation,
         }
-        self._pre_silu_qspecs = {
-            "int8": get_symmetric_activation_qdq_config().input_activation,
-            "int16": get_symmetric_activation_int16_qdq_config().input_activation,
-        }
         self._gradient_qspecs = {
             "int8": get_symmetric_gradient_qdq_config().input_activation,
             "int16": get_symmetric_gradient_int16_qdq_config().input_activation,
@@ -766,8 +1081,6 @@ class _LayerWiseQuantFormatResolver:
             if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS:
                 raise ValueError(f"fp16 is only supported for backward edges: {edge_kind}")
             return self._fp16_qspec
-        if edge_kind in _LAYERWISE_SYMMETRIC_ACTIVATION_EDGE_KINDS:
-            return self._pre_silu_qspecs[quant_format]
         if edge_kind in _LAYERWISE_AFFINE_ACTIVATION_EDGE_KINDS:
             return self._activation_qspecs[quant_format]
         if edge_kind in _LAYERWISE_GRADIENT_EDGE_KINDS:
@@ -835,13 +1148,14 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         layer_quantization_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
-        if backward_quantization_mode not in {"all", "none", "conv_silu"}:
+        if backward_quantization_mode not in _BACKWARD_QUANTIZATION_MODES:
             raise ValueError(
-                "backward_quantization_mode must be one of {'all', 'none', 'conv_silu'}"
+                "backward_quantization_mode must be one of "
+                f"{sorted(_BACKWARD_QUANTIZATION_MODES)}"
             )
         self.activation_config = activation_config or get_affine_activation_qdq_config()
         self.pre_silu_activation_config = (
-            pre_silu_activation_config or get_symmetric_activation_qdq_config()
+            pre_silu_activation_config or get_affine_activation_qdq_config()
         )
         self.gradient_config = gradient_config or get_symmetric_gradient_qdq_config()
         self.weight_config = weight_config or get_symmetric_weight_qdq_config()
@@ -991,6 +1305,32 @@ def annotate_joint_backward_qdq_edges(
     else:
         pre_silu_sources, silu_outputs, silu_internal_sigmoids = set(), set(), set()
     producer_output_qspec_nodes = pre_silu_sources | silu_outputs
+    annotation_rule_enabled = backward_quantization_mode == "annotation_rule"
+    detect_head_indices = (
+        _detect_head_model_indices(gm) if annotation_rule_enabled else set()
+    )
+    attention_model_indices = (
+        _attention_model_indices(gm) if annotation_rule_enabled else set()
+    )
+    model_backward_node_names = (
+        _annotation_rule_model_backward_node_names(
+            gm,
+            phase_forward_node_names=phase_forward_node_names,
+            loss_output_names=loss_output_names,
+            detect_head_indices=detect_head_indices,
+            attention_model_indices=attention_model_indices,
+            loss_only_node_names=loss_only_node_names,
+        )
+        if annotation_rule_enabled
+        else set()
+    )
+    annotation_rule_counts = {
+        "quantized_input_edges": 0,
+        "quantized_output_nodes": 0,
+        "skip_loss_path": 0,
+        "skip_attention": 0,
+        "skip_non_model": 0,
+    }
 
     input_edges = 0
     requested_output_qdq_nodes: set[Node] = set()
@@ -1033,8 +1373,34 @@ def annotate_joint_backward_qdq_edges(
                 output_qspec = resolve_qspec(
                     "final_forward_output", activation_qspec, node
                 )
+        elif (
+            annotation_rule_enabled
+            and in_backward
+            and _is_float_tensor_node(node)
+            and not _is_metadata_only_factory_node(node)
+            and not _is_view_like_node(node)
+            and _has_annotation_rule_boundary_consumer(
+                node,
+                model_backward_node_names,
+            )
+        ):
+            output_qspec = resolve_qspec("backward_gradient", gradient_qspec, node)
+        if output_qspec is not None and annotation_rule_enabled:
+            decision = _annotation_rule_output_decision(
+                node=node,
+                detect_head_indices=detect_head_indices,
+                model_backward_node_names=model_backward_node_names,
+                attention_model_indices=attention_model_indices,
+                loss_only_node_names=loss_only_node_names,
+            )
+            if decision != "quantize":
+                annotation_rule_counts[decision] += 1
+                output_qspec = None
+            else:
+                annotation_rule_counts["quantized_output_nodes"] += 1
         if output_qspec is not None:
             requested_output_qdq_nodes.add(node)
+            producer_output_qspec_nodes.add(node)
 
         if not _is_compute_consumer(node) and output_qspec is None:
             skipped_view_like_consumers += int(_is_view_like_node(node))
@@ -1065,12 +1431,30 @@ def annotate_joint_backward_qdq_edges(
                 if not _is_quantizable_input_node(input_node):
                     continue
                 origin = _origin_node(input_node)
+                if _is_metadata_only_factory_node(
+                    input_node
+                ) or _is_metadata_only_factory_node(origin):
+                    continue
                 if origin in producer_output_qspec_nodes:
                     continue
                 if input_node in silu_internal_sigmoids:
                     continue
                 if _is_decomposed_silu_internal_edge(input_node, node):
                     continue
+                if annotation_rule_enabled:
+                    decision = _annotation_rule_edge_decision(
+                        node=node,
+                        input_node=input_node,
+                        origin=origin,
+                        detect_head_indices=detect_head_indices,
+                        model_backward_node_names=model_backward_node_names,
+                        attention_model_indices=attention_model_indices,
+                        loss_only_node_names=loss_only_node_names,
+                    )
+                    if decision != "quantize":
+                        annotation_rule_counts[decision] += 1
+                        continue
+                    annotation_rule_counts["quantized_input_edges"] += 1
                 if _is_parameter_weight_node(input_node):
                     input_qspec_map[input_node] = weight_qspec
                 elif in_backward and (
@@ -1158,6 +1542,14 @@ def annotate_joint_backward_qdq_edges(
         "joint_qdq_silu_outputs": len(silu_outputs),
         "joint_qdq_silu_internal_sigmoids": len(silu_internal_sigmoids),
         "joint_qdq_conv_silu_backward_edges": conv_silu_backward_edges,
+        "joint_qdq_annotation_rule_detect_head_indices": sorted(detect_head_indices),
+        "joint_qdq_annotation_rule_attention_indices": sorted(
+            attention_model_indices
+        ),
+        "joint_qdq_annotation_rule_model_backward_nodes": len(
+            model_backward_node_names
+        ),
+        "joint_qdq_annotation_rule": annotation_rule_counts,
     }
 
 
@@ -1387,16 +1779,16 @@ def _insert_ste_mask(
 def _find_converted_silu_qdq(gm: GraphModule) -> list[tuple[Node, Node, Node, Node]]:
     matches: list[tuple[Node, Node, Node, Node]] = []
     for node in gm.graph.nodes:
-        if not _is_quantize_per_tensor_node(node) or not _is_symmetric_qdq_quantize(node):
+        if not _is_quantize_per_tensor_node(node) or not _is_affine_qdq_quantize(node):
             continue
-        qsym_quantize = node
-        pre_silu_source = _quantize_source(qsym_quantize)
+        pre_silu_quantize = node
+        pre_silu_source = _quantize_source(pre_silu_quantize)
         if pre_silu_source is None:
             continue
         silu_nodes = [
             candidate
             for candidate in gm.graph.nodes
-            if _is_converted_decomposed_silu_node(candidate, qsym_quantize)
+            if _is_converted_decomposed_silu_node(candidate, pre_silu_quantize)
         ]
         for silu_node in silu_nodes:
             qasym_candidates = [
@@ -1406,15 +1798,17 @@ def _find_converted_silu_qdq(gm: GraphModule) -> list[tuple[Node, Node, Node, No
             ]
             for qasym_quantize in qasym_candidates:
                 matches.append(
-                    (pre_silu_source, qsym_quantize, silu_node, qasym_quantize)
+                    (pre_silu_source, pre_silu_quantize, silu_node, qasym_quantize)
                 )
     return matches
 
 
-def _find_silu_backward_grads(gm: GraphModule, qsym_quantize: Node) -> list[tuple[Node, Node]]:
+def _find_silu_backward_grads(
+    gm: GraphModule, pre_silu_quantize: Node
+) -> list[tuple[Node, Node]]:
     candidates: list[tuple[Node, Node]] = []
-    qsym_source = _quantize_source(qsym_quantize)
-    if qsym_source is None:
+    pre_silu_source = _quantize_source(pre_silu_quantize)
+    if pre_silu_source is None:
         return candidates
     for node in gm.graph.nodes:
         if (
@@ -1433,12 +1827,12 @@ def _find_silu_backward_grads(gm: GraphModule, qsym_quantize: Node) -> list[tupl
         ):
             continue
         for derivative_arg in node_args:
-            if not _is_silu_derivative_arg(derivative_arg, qsym_quantize):
+            if not _is_silu_derivative_arg(derivative_arg, pre_silu_quantize):
                 continue
             for gradient_input in node_args:
                 if gradient_input is derivative_arg:
                     continue
-                if not _same_known_shape(gradient_input, qsym_source):
+                if not _same_known_shape(gradient_input, pre_silu_source):
                     continue
                 candidates.append((node, gradient_input))
     return candidates
@@ -1460,7 +1854,7 @@ def _replace_node_arg(node: Node, old_arg: Node, new_arg: Node) -> bool:
 
 def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
     qasym_masks = 0
-    qsym_masks = 0
+    pre_silu_masks = 0
     matched_backward = 0
     matches = _find_converted_silu_qdq(gm)
     if not matches:
@@ -1470,15 +1864,15 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
             "joint_ste_conv_silu_matches": 0,
         }
 
-    for pre_silu_source, qsym_quantize, silu_node, qasym_quantize in matches:
-        qsym_source = _quantize_source(qsym_quantize)
+    for pre_silu_source, pre_silu_quantize, silu_node, qasym_quantize in matches:
+        pre_silu_quantize_source = _quantize_source(pre_silu_quantize)
         qasym_source = _quantize_source(qasym_quantize)
-        if qsym_source is None or qasym_source is None:
+        if pre_silu_quantize_source is None or qasym_source is None:
             continue
-        if qsym_source is not pre_silu_source or qasym_source is not silu_node:
+        if pre_silu_quantize_source is not pre_silu_source or qasym_source is not silu_node:
             continue
 
-        silu_grad_matches = _find_silu_backward_grads(gm, qsym_quantize)
+        silu_grad_matches = _find_silu_backward_grads(gm, pre_silu_quantize)
         if not silu_grad_matches:
             continue
 
@@ -1512,33 +1906,33 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
             if _replace_node_arg(silu_grad, gradient_input, masked_gradient):
                 qasym_masks += 1
 
-            qsym_mask_insert_before = (
+            pre_silu_mask_insert_before = (
                 silu_grad_quantize_users[0]
                 if silu_grad_quantize_users
                 else conv_backward_users[0]
             )
-            qsym_mask = _insert_ste_mask(
+            pre_silu_mask = _insert_ste_mask(
                 gm,
-                source_node=qsym_source,
-                quantize_node=qsym_quantize,
-                insert_before=qsym_mask_insert_before,
+                source_node=pre_silu_quantize_source,
+                quantize_node=pre_silu_quantize,
+                insert_before=pre_silu_mask_insert_before,
             )
-            with gm.graph.inserting_before(qsym_mask_insert_before):
+            with gm.graph.inserting_before(pre_silu_mask_insert_before):
                 masked_silu_grad = gm.graph.call_function(
-                    torch.ops.aten.mul.Tensor, args=(silu_grad, qsym_mask)
+                    torch.ops.aten.mul.Tensor, args=(silu_grad, pre_silu_mask)
                 )
             for quantize_user in silu_grad_quantize_users:
                 quantize_user.args = (masked_silu_grad, *quantize_user.args[1:])
             for conv_backward in conv_backward_users:
                 _replace_node_arg(conv_backward, silu_grad, masked_silu_grad)
             if silu_grad_quantize_users or conv_backward_users:
-                qsym_masks += 1
+                pre_silu_masks += 1
                 matched_backward += 1
 
     gm.graph.eliminate_dead_code()
     gm.recompile()
     return {
         "joint_ste_qasym_masks": qasym_masks,
-        "joint_ste_qsym_masks": qsym_masks,
+        "joint_ste_qsym_masks": pre_silu_masks,
         "joint_ste_conv_silu_matches": matched_backward,
     }
