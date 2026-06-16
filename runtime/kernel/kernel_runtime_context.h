@@ -11,6 +11,7 @@
 #include <executorch/runtime/core/error.h>
 #include <executorch/runtime/core/event_tracer_hooks.h>
 #include <executorch/runtime/core/memory_allocator.h>
+#include <executorch/runtime/core/named_data_map.h>
 #include <executorch/runtime/core/result.h>
 #include <executorch/runtime/platform/compiler.h>
 
@@ -28,19 +29,26 @@ class KernelRuntimeContext {
   /**
    * Construct a new kernel runtime context.
    *
-   * KernelRuntimeContext does not take ownership
-   * of these pointers, so they must outlive the context instance.
+   * KernelRuntimeContext does not take ownership of these pointers, so they
+   * must outlive the context instance. If named_data_map is provided by
+   * Program::load_method(), it is borrowed from the caller or Program and must
+   * also outlive any Method execution that may access it through this context.
    *
    * @param[in] event_tracer The optional EventTracer to use for
    *     profiling/debugging
    * @param[in] temp_allocator The optional MemoryAllocator used to allocate
    *     temporary memory for the kernel. If not provided, an error will be
    *     returned when calling allocate_temp.
+   * @param[in] named_data_map The optional borrowed NamedDataMap visible to the
+   *     kernel during this call.
    */
   KernelRuntimeContext(
       EventTracer* event_tracer = nullptr,
-      MemoryAllocator* temp_allocator = nullptr)
-      : event_tracer_(event_tracer), temp_allocator_(temp_allocator) {}
+      MemoryAllocator* temp_allocator = nullptr,
+      const NamedDataMap* named_data_map = nullptr)
+      : event_tracer_(event_tracer),
+        temp_allocator_(temp_allocator),
+        named_data_map_(named_data_map) {}
   /**
    * Tells the runtime that the kernel call has failed. Prefer this over
    * ET_CHECK_*(), which fatally panics the process/system.
@@ -99,11 +107,18 @@ class KernelRuntimeContext {
     return temp_memory;
   }
 
+  /// Returns the borrowed PTE/external named data map visible to this method,
+  /// if any.
+  ET_NODISCARD const NamedDataMap* named_data_map() const {
+    return named_data_map_;
+  }
+
   // TODO(T147221312): Add a way to resize a tensor.
 
  private:
   EventTracer* event_tracer_ = nullptr;
   MemoryAllocator* temp_allocator_ = nullptr;
+  const NamedDataMap* named_data_map_ = nullptr;
   Error failure_state_ = Error::Ok;
 };
 

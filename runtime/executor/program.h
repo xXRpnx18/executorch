@@ -138,8 +138,10 @@ class Program final {
    *     execution of the loaded method. If `memory_manager.temp_allocator()` is
    *     null, the runtime will allocate temp memory using `et_pal_allocate()`.
    * @param[in] event_tracer The event tracer to use for this method run.
-   * @param[in] named_data_map An optional map of {name, blob} used to resolve
-   *     data that is external to the PTE, if any.
+   * @param[in] named_data_map An optional borrowed map of {name, blob} used to
+   *     resolve data that is external to the PTE, if any. If provided, this map
+   *     must outlive the returned Method and all Method executions that may
+   *     access KernelRuntimeContext::named_data_map().
    * @param[in] backend_options An optional map of per-backend load-time options
    *     (RuntimeSpecs). Each backend will receive its corresponding options
    *     during initialization.

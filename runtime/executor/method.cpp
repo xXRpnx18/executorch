@@ -932,6 +932,7 @@ Error Method::init(
     } else if (pte_data_map.ok()) {
       named_data_map = pte_data_map.get();
     }
+    kernel_named_data_map_ = named_data_map;
 
     // n_delegate_ counts the number of successfully-initialized delegates for
     // ~Method() to clean up, and is incremented at the bottom of the loop. This
@@ -1454,7 +1455,8 @@ Error Method::execute_instruction() {
       internal::EventTracerProfileOpScope event_tracer_op_scope =
           internal::EventTracerProfileOpScope(event_tracer_, "OPERATOR_CALL");
       // TODO(T147221312): Also expose tensor resizer via the context.
-      KernelRuntimeContext context(event_tracer_, temp_allocator_);
+      KernelRuntimeContext context(
+          event_tracer_, temp_allocator_, kernel_named_data_map_);
       auto args = chain.argument_lists_[step_state_.instr_idx];
       chain.kernels_[step_state_.instr_idx](context, args);
       // We reset the temp_allocator after the switch statement
