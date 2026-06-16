@@ -4,6 +4,7 @@
 # Python environment and cache
 .hypothesis
 .mypy_cache/
+.venv
 .venv/
 __pycache__/
 
@@ -19,6 +20,7 @@ cmake-out-android/
 build-android/
 build-x86/
 build-hexagon/
+build_release
 build_release/
 dist/
 arm-scratch/
