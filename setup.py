@@ -77,11 +77,15 @@ from setuptools import Extension, setup
 from setuptools.command.build import build
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
+from setuptools.dist import Distribution
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+# The local wheel only exports PTEs; C++ runtime builds use the standalone CMake path.
+_BUILD_NATIVE_WHEEL = os.getenv("EXECUTORCH_BUILD_NATIVE_WHEEL") == "1"
 
 try:
     from tools.cmake.cmake_cache import CMakeCache
@@ -645,6 +649,13 @@ class CustomBuildPy(build_py):
                     self.copy_file(src_file, dst_file, preserve_mode=False)
 
 
+class ExportOnlyDistribution(Distribution):
+    """Marks the default export wheel as pure Python."""
+
+    def has_ext_modules(self):
+        return _BUILD_NATIVE_WHEEL and super().has_ext_modules()
+
+
 class Buck2EnvironmentFixer(contextlib.AbstractContextManager):
     """Removes HOME from the environment when running as root.
 
@@ -687,6 +698,9 @@ class CustomBuild(build):
         self.build_base = "pip-out"
 
     def run(self):  # noqa C901
+        if not _BUILD_NATIVE_WHEEL:
+            return super().run()
+
         self.dump_options()
         cmake_build_type = get_build_type(self.debug)
         # get_python_lib() typically returns the path to site-packages, where
@@ -843,6 +857,12 @@ class CustomBuild(build):
 
 setup(
     version=Version.string(),
+    distclass=ExportOnlyDistribution,
+    entry_points=(
+        {"console_scripts": ["flatc=executorch.data.bin:flatc"]}
+        if _BUILD_NATIVE_WHEEL
+        else {}
+    ),
     cmdclass={
         "build": CustomBuild,
         "build_ext": InstallerBuildExt,

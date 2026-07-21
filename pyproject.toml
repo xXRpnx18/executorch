@@ -97,12 +97,6 @@ Repository = "https://github.com/pytorch/executorch"
 Issues = "https://github.com/pytorch/executorch/issues"
 Changelog = "https://github.com/pytorch/executorch/releases"
 
-# Tell setuptools to generate commandline wrappers for tools that we install
-# under data/bin in the pip package. This will put these commands on the user's
-# path.
-[project.scripts]
-flatc = "executorch.data.bin:flatc"
-
 # TODO(dbort): Could use py_modules to restrict the set of modules we
 # package, and package_data to restrict the set up non-python files we
 # include. See also setuptools/discovery.py for custom finders.

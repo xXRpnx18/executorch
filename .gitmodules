@@ -65,6 +65,7 @@
 [submodule "third-party/pybind11"]
 	path = third-party/pybind11
 	url = https://github.com/pybind/pybind11.git
+	update = none
 [submodule "third-party/ao"]
 	path = third-party/ao
 	url = https://github.com/pytorch/ao.git
