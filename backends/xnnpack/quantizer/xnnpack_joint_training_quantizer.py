@@ -357,6 +357,19 @@ def _make_quantization_config(
     )
 
 
+def _qspecs_are_compatible(lhs: QuantizationSpec, rhs: QuantizationSpec) -> bool:
+    return (
+        lhs.dtype == rhs.dtype
+        and lhs.quant_min == rhs.quant_min
+        and lhs.quant_max == rhs.quant_max
+        and lhs.qscheme == rhs.qscheme
+        and lhs.ch_axis == rhs.ch_axis
+        and lhs.is_dynamic == rhs.is_dynamic
+        and repr(lhs.observer_or_fake_quant_ctr)
+        == repr(rhs.observer_or_fake_quant_ctr)
+    )
+
+
 def get_affine_activation_qdq_config(
     *,
     act_qmin: int = -128,
@@ -1327,6 +1340,7 @@ def annotate_joint_backward_qdq_edges(
     annotation_rule_counts = {
         "quantized_input_edges": 0,
         "quantized_output_nodes": 0,
+        "reuse_producer_output_qspec": 0,
         "skip_loss_path": 0,
         "skip_attention": 0,
         "skip_non_model": 0,
@@ -1461,13 +1475,27 @@ def annotate_joint_backward_qdq_edges(
                     origin in forward_value_nodes
                     or _is_user_activation_placeholder(origin)
                 ):
-                    input_qspec_map[input_node] = resolve_qspec(
+                    saved_activation_qspec = resolve_qspec(
                         "backward_saved_activation",
                         activation_qspec,
                         node,
                         input_node,
                         origin,
                     )
+                    producer_annotation = origin.meta.get(Q_ANNOTATION_KEY)
+                    if (
+                        isinstance(producer_annotation, QuantizationAnnotation)
+                        and producer_annotation.output_qspec is not None
+                        and _qspecs_are_compatible(
+                            producer_annotation.output_qspec,
+                            saved_activation_qspec,
+                        )
+                    ):
+                        annotation_rule_counts["reuse_producer_output_qspec"] += 1
+                        if annotation_rule_enabled:
+                            annotation_rule_counts["quantized_input_edges"] -= 1
+                        continue
+                    input_qspec_map[input_node] = saved_activation_qspec
                 else:
                     edge_kind = (
                         "backward_gradient" if in_backward else "forward_activation"
