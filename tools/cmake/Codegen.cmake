@@ -42,8 +42,11 @@ function(gen_selected_ops)
 
   file(GLOB_RECURSE _codegen_tools_srcs "${EXECUTORCH_ROOT}/codegen/tools/*.py")
 
-  set(_gen_oplist_command "${PYTHON_EXECUTABLE}" -m codegen.tools.gen_oplist
-                          --output_path=${_oplist_yaml}
+  set(_gen_oplist_command
+      "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${EXECUTORCH_ROOT}/..:$ENV{PYTHONPATH}"
+      "${PYTHON_EXECUTABLE}" -m codegen.tools.gen_oplist
+      --output_path=${_oplist_yaml}
   )
 
   if(GEN_OPS_SCHEMA_YAML)

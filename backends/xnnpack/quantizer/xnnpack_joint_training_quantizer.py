@@ -27,6 +27,7 @@ from torchao.quantization.pt2e.quantizer import (
     QuantizationConfig,
     QuantizationSpec,
     Quantizer,
+    SharedQuantizationSpec,
 )
 from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 from torchao.quantization.pt2e.utils import _fuse_conv_bn_
@@ -1486,9 +1487,15 @@ def annotate_joint_backward_qdq_edges(
                     if (
                         isinstance(producer_annotation, QuantizationAnnotation)
                         and producer_annotation.output_qspec is not None
-                        and _qspecs_are_compatible(
-                            producer_annotation.output_qspec,
-                            saved_activation_qspec,
+                        and (
+                            isinstance(
+                                producer_annotation.output_qspec,
+                                SharedQuantizationSpec,
+                            )
+                            or _qspecs_are_compatible(
+                                producer_annotation.output_qspec,
+                                saved_activation_qspec,
+                            )
                         )
                     ):
                         annotation_rule_counts["reuse_producer_output_qspec"] += 1
