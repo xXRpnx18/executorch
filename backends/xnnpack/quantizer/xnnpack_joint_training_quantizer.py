@@ -67,6 +67,7 @@ _SKIP_PLACEHOLDER_TOKENS = (
 )
 
 _VIEW_LIKE_TARGETS = {
+    torch.ops.aten.alias.default,
     torch.ops.aten.permute.default,
     torch.ops.aten.permute_copy.default,
     torch.ops.aten.view.default,
