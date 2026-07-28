@@ -20,6 +20,7 @@ if _VENDORED_TORCHAO.is_dir() and str(_VENDORED_TORCHAO) not in sys.path:
 from torchao.quantization.pt2e import (
     HistogramObserver,
     MinMaxObserver,
+    PerChannelMinMaxObserver,
     PlaceholderObserver,
 )
 from torchao.quantization.pt2e.quantizer import (
@@ -463,14 +464,37 @@ def get_symmetric_gradient_int16_qdq_config() -> QuantizationConfig:
     return _make_quantization_config(grad_quantization_spec, grad_quantization_spec)
 
 
-def get_symmetric_weight_qdq_config() -> QuantizationConfig:
+def get_symmetric_weight_qdq_config(*, per_channel: bool = False) -> QuantizationConfig:
+    """Weight qspec for trainable conv weights.
+
+    Must stay byte-equivalent to the vendored per-channel branch in
+    ``xnnpack_quantizer.get_symmetric_quantization_config`` (qscheme, ch_axis,
+    observer, eps, range). The forward and backward phases annotate the *same*
+    weight tensor through two independent observers -- forward via
+    ``XNNPACKQuantizer`` + ``forward_quantization_config``, backward via this
+    config, because ``annotate_forward_compute_edges`` is False whenever the
+    XNNPACK forward quantizer is in use. If the two disagree,
+    ``_collect_pt2e_weight_qparams`` raises "conflicting PT2E weight qparams".
+
+    ``per_channel=False`` is kept for A/B measurement and legacy reproduction
+    only; per-output-channel axis 0 is the production configuration.
+    """
+
     weight_quantization_spec = QuantizationSpec(
         dtype=torch.int8,
         quant_min=-127,
         quant_max=127,
-        qscheme=torch.per_tensor_symmetric,
-        observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
+        qscheme=(
+            torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric
+        ),
+        ch_axis=0,
+        is_dynamic=False,
+        observer_or_fake_quant_ctr=(
+            PerChannelMinMaxObserver if per_channel else MinMaxObserver
+        ).with_args(eps=2**-12),
     )
+    # _make_quantization_config also places the weight spec in the activation
+    # slot; only `.weight` is ever read from this config, so that is inert.
     return _make_quantization_config(weight_quantization_spec, weight_quantization_spec)
 
 
