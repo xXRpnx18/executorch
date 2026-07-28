@@ -464,7 +464,7 @@ def get_symmetric_gradient_int16_qdq_config() -> QuantizationConfig:
     return _make_quantization_config(grad_quantization_spec, grad_quantization_spec)
 
 
-def get_symmetric_weight_qdq_config(*, per_channel: bool = False) -> QuantizationConfig:
+def get_symmetric_weight_qdq_config(*, per_channel: bool = True) -> QuantizationConfig:
     """Weight qspec for trainable conv weights.
 
     Must stay byte-equivalent to the vendored per-channel branch in
