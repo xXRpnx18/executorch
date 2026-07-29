@@ -4,6 +4,7 @@ from __future__ import annotations
 import operator
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -163,6 +164,36 @@ _ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS = {
     torch.ops.aten.cat.default,
     torch.ops.aten.mul.Tensor,
 }
+
+
+@dataclass(frozen=True)
+class JointBackwardAnnotationOptions:
+    """Model-family knobs for the annotation_rule backward pass.
+
+    Defaults reproduce the historical module constants exactly, so existing
+    (YOLO) exports are byte-identical when no options are supplied. A family
+    whose loss region legitimately uses ops like ``where.self``/``scatter.value``
+    (e.g. a decomposed cross-entropy) overrides ``loss_path_targets`` /
+    ``loss_path_text_tokens`` so those gradients are not skipped, and extends
+    ``boundary_consumer_targets`` with its backward consumers.
+    """
+
+    loss_path_targets: frozenset = field(
+        default_factory=lambda: frozenset(_LOSS_PATH_TARGETS)
+    )
+    loss_path_text_tokens: tuple[str, ...] = _LOSS_PATH_TEXT_TOKENS
+    boundary_consumer_targets: frozenset = field(
+        default_factory=lambda: frozenset(_ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS)
+    )
+
+
+def _resolve_annotation_options(
+    options: JointBackwardAnnotationOptions | None,
+) -> JointBackwardAnnotationOptions:
+    return options if options is not None else _DEFAULT_ANNOTATION_OPTIONS
+
+
+_DEFAULT_ANNOTATION_OPTIONS = JointBackwardAnnotationOptions()
 
 _LAYERWISE_EDGE_KINDS = {
     "forward_activation",
@@ -753,14 +784,16 @@ def _is_loss_path_related(
     loss_only_node_names: set[str] | None,
     *,
     max_depth: int = 3,
+    options: JointBackwardAnnotationOptions | None = None,
 ) -> bool:
+    options = _resolve_annotation_options(options)
     related = _collect_related_nodes(nodes, max_depth=max_depth)
     if loss_only_node_names is not None and any(
         node.name in loss_only_node_names for node in related
     ):
         return True
     if any(
-        node.op == "call_function" and node.target in _LOSS_PATH_TARGETS
+        node.op == "call_function" and node.target in options.loss_path_targets
         for node in related
     ):
         return True
@@ -770,7 +803,7 @@ def _is_loss_path_related(
         if any(
             token in text
             for text in _lower_match_texts((node,), max_depth=0)
-            for token in _LOSS_PATH_TEXT_TOKENS
+            for token in options.loss_path_text_tokens
         ):
             return True
     return False
@@ -840,8 +873,9 @@ def _annotation_rule_edge_decision(
     model_backward_node_names: set[str],
     attention_model_indices: set[str],
     loss_only_node_names: set[str] | None,
+    options: JointBackwardAnnotationOptions | None = None,
 ) -> str:
-    if _is_loss_path_related((node,), loss_only_node_names, max_depth=0):
+    if _is_loss_path_related((node,), loss_only_node_names, max_depth=0, options=options):
         return "skip_loss_path"
     if _is_loss_path_related(
         (input_node, origin),
@@ -876,9 +910,10 @@ def _annotation_rule_output_decision(
     model_backward_node_names: set[str],
     attention_model_indices: set[str],
     loss_only_node_names: set[str] | None,
+    options: JointBackwardAnnotationOptions | None = None,
 ) -> str:
     related = (node,)
-    if _is_loss_path_related(related, loss_only_node_names, max_depth=1):
+    if _is_loss_path_related(related, loss_only_node_names, max_depth=1, options=options):
         return "skip_loss_path"
     if _is_attention_related(
         related,
@@ -905,6 +940,7 @@ def _annotation_rule_model_backward_node_names(
     detect_head_indices: set[str],
     attention_model_indices: set[str],
     loss_only_node_names: set[str] | None,
+    options: JointBackwardAnnotationOptions | None = None,
 ) -> set[str]:
     roots: list[Node] = []
     in_backward = False
@@ -918,7 +954,7 @@ def _annotation_rule_model_backward_node_names(
             continue
         if node.name in loss_output_names:
             continue
-        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1):
+        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1, options=options):
             continue
         if _is_attention_related(
             (node,),
@@ -941,7 +977,7 @@ def _annotation_rule_model_backward_node_names(
             continue
         if node.name in loss_output_names:
             continue
-        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1):
+        if _is_loss_path_related((node,), loss_only_node_names, max_depth=1, options=options):
             continue
         if _is_attention_related(
             (node,),
@@ -958,11 +994,13 @@ def _annotation_rule_model_backward_node_names(
 def _has_annotation_rule_boundary_consumer(
     node: Node,
     model_backward_node_names: set[str],
+    options: JointBackwardAnnotationOptions | None = None,
 ) -> bool:
+    options = _resolve_annotation_options(options)
     return any(
         user.name in model_backward_node_names
         and user.op == "call_function"
-        and user.target in _ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS
+        and user.target in options.boundary_consumer_targets
         for user in node.users
     )
 
@@ -1170,6 +1208,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         forward_quantization_config: QuantizationConfig | None = None,
         forward_filter_fn: Callable[[Node], bool] | None = None,
         layer_quantization_config: dict[str, Any] | None = None,
+        annotation_options: JointBackwardAnnotationOptions | None = None,
     ) -> None:
         super().__init__()
         if backward_quantization_mode not in _BACKWARD_QUANTIZATION_MODES:
@@ -1194,6 +1233,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             or get_symmetric_quantization_config(is_per_channel=False)
         )
         self.forward_filter_fn = forward_filter_fn
+        self.annotation_options = annotation_options
         self.layer_quantization_resolver = (
             _LayerWiseQuantFormatResolver(layer_quantization_config)
             if layer_quantization_config is not None
@@ -1259,6 +1299,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
 
         self.annotation_report = annotate_joint_backward_qdq_edges(
             model,
+            annotation_options=self.annotation_options,
             activation_qspec=self.activation_config.input_activation,
             pre_silu_activation_qspec=self.pre_silu_activation_config.input_activation,
             gradient_qspec=self.gradient_config.input_activation,
@@ -1298,6 +1339,7 @@ def annotate_joint_backward_qdq_edges(
     weight_qspec: QuantizationSpec,
     loss_output_names: set[str],
     final_output_names: set[str],
+    annotation_options: JointBackwardAnnotationOptions | None = None,
     backward_quantization_mode: str = "all",
     annotate_forward_compute_edges: bool = True,
     annotate_silu_edges: bool = True,
@@ -1339,6 +1381,7 @@ def annotate_joint_backward_qdq_edges(
     model_backward_node_names = (
         _annotation_rule_model_backward_node_names(
             gm,
+            options=annotation_options,
             phase_forward_node_names=phase_forward_node_names,
             loss_output_names=loss_output_names,
             detect_head_indices=detect_head_indices,
@@ -1406,11 +1449,13 @@ def annotate_joint_backward_qdq_edges(
             and _has_annotation_rule_boundary_consumer(
                 node,
                 model_backward_node_names,
+                options=annotation_options,
             )
         ):
             output_qspec = resolve_qspec("backward_gradient", gradient_qspec, node)
         if output_qspec is not None and annotation_rule_enabled:
             decision = _annotation_rule_output_decision(
+                options=annotation_options,
                 node=node,
                 detect_head_indices=detect_head_indices,
                 model_backward_node_names=model_backward_node_names,
@@ -1467,6 +1512,7 @@ def annotate_joint_backward_qdq_edges(
                     continue
                 if annotation_rule_enabled:
                     decision = _annotation_rule_edge_decision(
+                        options=annotation_options,
                         node=node,
                         input_node=input_node,
                         origin=origin,
