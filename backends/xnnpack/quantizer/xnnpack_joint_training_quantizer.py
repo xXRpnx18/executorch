@@ -321,6 +321,55 @@ def _is_quantizable_input_node(node: Node) -> bool:
     return node.op in {"call_function", "call_method", "get_attr"}
 
 
+def _existing_output_qspec(node: Node):
+    """The output qspec a previous annotation pass already put on ``node``."""
+
+    annotation = node.meta.get(Q_ANNOTATION_KEY)
+    return getattr(annotation, "output_qspec", None) if annotation is not None else None
+
+
+def _concrete_qspec(qspec, depth: int = 8):
+    """Follow ``SharedQuantizationSpec`` links to the spec that carries dtypes.
+
+    A shared spec names another edge or node instead of describing a wire
+    format, so it has no ``dtype`` of its own; comparing it directly makes every
+    field read ``None``.
+    """
+
+    for _ in range(depth):
+        edge_or_node = getattr(qspec, "edge_or_node", None)
+        if edge_or_node is None:
+            return qspec
+        if isinstance(edge_or_node, tuple):
+            input_node, owner = edge_or_node
+            annotation = owner.meta.get(Q_ANNOTATION_KEY)
+            qspec = (getattr(annotation, "input_qspec_map", None) or {}).get(input_node)
+        else:
+            annotation = edge_or_node.meta.get(Q_ANNOTATION_KEY)
+            qspec = getattr(annotation, "output_qspec", None)
+        if qspec is None:
+            return None
+    return None
+
+
+def _qspec_interchangeable(produced, consumed) -> bool:
+    """Can a consumer read ``produced`` instead of observing its own copy?
+
+    Only the wire format has to agree -- dtype and range.  Observer identity and
+    qscheme details differ freely between a symmetric weight-side config and an
+    affine activation config that still exchange the same int8 codes.
+    """
+
+    produced = _concrete_qspec(produced)
+    consumed = _concrete_qspec(consumed)
+    if produced is None or consumed is None:
+        return False
+    return all(
+        getattr(produced, field, None) == getattr(consumed, field, None)
+        for field in ("dtype", "quant_min", "quant_max", "qscheme")
+    )
+
+
 def _is_compute_consumer(node: Node) -> bool:
     if node.op not in {"call_function", "call_method"}:
         return False
@@ -1397,6 +1446,7 @@ def annotate_joint_backward_qdq_edges(
         "skip_loss_path": 0,
         "skip_attention": 0,
         "skip_non_model": 0,
+        "reuse_producer_output_qspec": 0,
     }
 
     input_edges = 0
@@ -1505,6 +1555,34 @@ def annotate_joint_backward_qdq_edges(
                 ) or _is_metadata_only_factory_node(origin):
                     continue
                 if origin in producer_output_qspec_nodes:
+                    annotation_rule_counts["reuse_producer_output_qspec"] += 1
+                    continue
+                # Which qspec this edge would otherwise get; mirrors the
+                # three-way choice made further down.
+                saved_activation_edge = in_backward and (
+                    origin in forward_value_nodes
+                    or _is_user_activation_placeholder(origin)
+                )
+                if _is_parameter_weight_node(input_node):
+                    candidate_qspec = weight_qspec
+                elif saved_activation_edge:
+                    candidate_qspec = activation_qspec
+                elif in_backward:
+                    candidate_qspec = gradient_qspec
+                else:
+                    candidate_qspec = activation_qspec
+                # A producer annotated by an earlier pass already emits a
+                # quantized output.  Observing it again here gives each
+                # consumer its own scale, and consumers that must agree on the
+                # wire (the DFL loss backward and the decode backward both read
+                # cat_17) then disagree once calibration sees enough samples to
+                # separate them.  Reuse the producer's qspec when the wire
+                # format matches.
+                if _qspec_interchangeable(
+                    _existing_output_qspec(origin), candidate_qspec
+                ):
+                    annotation_rule_counts["reuse_producer_output_qspec"] += 1
+                    producer_output_qspec_nodes.add(origin)
                     continue
                 if input_node in silu_internal_sigmoids:
                     continue
