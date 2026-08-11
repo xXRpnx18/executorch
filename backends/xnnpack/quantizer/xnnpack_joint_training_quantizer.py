@@ -930,6 +930,7 @@ def _annotation_rule_edge_decision(
         (input_node, origin),
         loss_only_node_names,
         max_depth=1,
+        options=options,
     ):
         return "skip_loss_path"
     related = (node, input_node, origin)
