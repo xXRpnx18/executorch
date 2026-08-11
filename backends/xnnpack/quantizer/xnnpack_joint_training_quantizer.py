@@ -29,6 +29,7 @@ from torchao.quantization.pt2e.quantizer import (
     QuantizationConfig,
     QuantizationSpec,
     Quantizer,
+    SharedQuantizationSpec,
 )
 from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 from torchao.quantization.pt2e.utils import _fuse_conv_bn_
@@ -368,6 +369,22 @@ def _qspec_interchangeable(produced, consumed) -> bool:
         getattr(produced, field, None) == getattr(consumed, field, None)
         for field in ("dtype", "quant_min", "quant_max", "qscheme")
     )
+
+
+def _saved_activation_producer(node: Node) -> Node | None:
+    """The node whose observer a save-for-backward clone should share, if any.
+
+    Returns None unless the producer already carries a concrete output qspec:
+    pointing a SharedQuantizationSpec at an unannotated node makes prepare()
+    raise KeyError while resolving the share group.
+    """
+
+    if node.op != "call_function" or node.target is not torch.ops.aten.clone.default:
+        return None
+    producer = node.args[0] if node.args else None
+    if not isinstance(producer, Node):
+        return None
+    return producer if _existing_output_qspec(producer) is not None else None
 
 
 def _is_compute_consumer(node: Node) -> bool:
@@ -1448,6 +1465,7 @@ def annotate_joint_backward_qdq_edges(
         "skip_attention": 0,
         "skip_non_model": 0,
         "reuse_producer_output_qspec": 0,
+        "share_saved_activation_qspec": 0,
     }
 
     input_edges = 0
@@ -1504,6 +1522,16 @@ def annotate_joint_backward_qdq_edges(
             )
         ):
             output_qspec = resolve_qspec("backward_gradient", gradient_qspec, node)
+            saved_activation_producer = _saved_activation_producer(node)
+            if saved_activation_producer is not None:
+                # autograd saves a pre-activation as aten.clone. The copy holds
+                # the producer's values, but the clone is not an ancestor of any
+                # output, so it reads as "in backward" and lands on the gradient
+                # qspec -- a forward activation observed as a gradient, on a
+                # symmetric grid that wastes the range the affine producer uses.
+                # Share the producer's observer so both carry one set of qparams.
+                output_qspec = SharedQuantizationSpec(saved_activation_producer)
+                annotation_rule_counts["share_saved_activation_qspec"] += 1
         if output_qspec is not None and annotation_rule_enabled:
             decision = _annotation_rule_output_decision(
                 options=annotation_options,
