@@ -1211,6 +1211,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         silu_output_filter_fn: Callable[[Node], bool] | None = None,
         forward_quantization_config: QuantizationConfig | None = None,
         forward_filter_fn: Callable[[Node], bool] | None = None,
+        backward_filter_fn: Callable[[Node], bool] | None = None,
         layer_quantization_config: dict[str, Any] | None = None,
         annotation_options: JointBackwardAnnotationOptions | None = None,
     ) -> None:
@@ -1231,6 +1232,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             is_per_channel=False
         )
         self.forward_filter_fn = forward_filter_fn
+        self.backward_filter_fn = backward_filter_fn
         self.annotation_options = annotation_options
         self.layer_quantization_resolver = (
             _LayerWiseQuantFormatResolver(layer_quantization_config) if layer_quantization_config is not None else None
@@ -1301,6 +1303,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             phase_forward_node_names=loss_forward_node_names | user_forward_node_names,
             loss_only_node_names=loss_forward_node_names - user_forward_node_names,
             qspec_resolver=self.layer_quantization_resolver,
+            backward_filter_fn=self.backward_filter_fn,
         )
         if self.layer_quantization_resolver is not None:
             self.annotation_report["joint_qdq_layerwise_config"] = self.layer_quantization_resolver.report()
@@ -1331,6 +1334,7 @@ def annotate_joint_backward_qdq_edges(
     phase_forward_node_names: set[str] | None = None,
     loss_only_node_names: set[str] | None = None,
     qspec_resolver: Callable[[str, QuantizationSpec, tuple[Node, ...]], QuantizationSpec] | None = None,
+    backward_filter_fn: Callable[[Node], bool] | None = None,
 ) -> dict[str, Any]:
     def resolve_qspec(
         edge_kind: str,
@@ -1388,6 +1392,23 @@ def annotate_joint_backward_qdq_edges(
         for node in gm.graph.nodes
         if phase_forward_node_names is not None and node.name in phase_forward_node_names
     }
+    backward_filtered_nodes = {
+        node
+        for node in gm.graph.nodes
+        if node.op in {"call_function", "call_method"}
+        and backward_filter_fn is not None
+        and not backward_filter_fn(node)
+    }
+    backward_filtered_parameter_gradients = {
+        user
+        for node in backward_filtered_nodes
+        if node.target == torch.ops.aten.convolution_backward.default
+        for user in node.users
+        if user.op == "call_function"
+        and user.target is operator.getitem
+        and len(user.args) > 1
+        and user.args[1] in {1, 2}
+    }
     in_backward = False
 
     for node in gm.graph.nodes:
@@ -1399,9 +1420,12 @@ def annotate_joint_backward_qdq_edges(
         else:
             in_backward = node.name not in phase_forward_node_names
         phase = "backward" if in_backward else "forward"
+        node_is_backward_filtered = in_backward and node in backward_filtered_nodes
 
         output_qspec = None
-        if node in pre_silu_sources and _is_float_tensor_node(node):
+        if node_is_backward_filtered or node in backward_filtered_parameter_gradients:
+            output_qspec = None
+        elif node in pre_silu_sources and _is_float_tensor_node(node):
             output_qspec = resolve_qspec("forward_pre_silu", pre_silu_activation_qspec, node)
         elif node in silu_outputs and _is_float_tensor_node(node):
             output_qspec = resolve_qspec("forward_silu_output", activation_qspec, node)
@@ -1458,13 +1482,15 @@ def annotate_joint_backward_qdq_edges(
             continue
 
         input_qspec_map: dict[Node, QuantizationSpec] = {}
-        if _is_compute_consumer(node):
+        if _is_compute_consumer(node) and not node_is_backward_filtered:
             for input_node in _iter_node_args(node.args):
                 if node.kwargs:
                     continue
                 if in_backward and backward_quantization_mode == "none":
                     continue
                 if in_backward and backward_quantization_mode == "conv_silu":
+                    continue
+                if input_node in backward_filtered_parameter_gradients:
                     continue
                 if not in_backward and not annotate_forward_compute_edges:
                     continue
@@ -1613,6 +1639,8 @@ def annotate_joint_backward_qdq_edges(
         "joint_qdq_annotation_rule_attention_indices": sorted(attention_model_indices),
         "joint_qdq_annotation_rule_model_backward_nodes": len(model_backward_node_names),
         "joint_qdq_annotation_rule": annotation_rule_counts,
+        "joint_qdq_backward_filter_excluded_nodes": len(backward_filtered_nodes),
+        "joint_qdq_backward_filter_excluded_parameter_gradients": len(backward_filtered_parameter_gradients),
     }
 
 
