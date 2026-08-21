@@ -122,16 +122,10 @@ _ATTENTION_TARGETS = {
     torch.ops.aten.softmax.int,
 }
 
-_YOLO_DETECT_INDEX_RE = re.compile(
-    r"^[pcb]_model_model_(\d+)_(?:cv2|cv3|dfl|m_|anchors|strides)(?:_|$)"
-)
-_YOLO_ATTENTION_INDEX_RE = re.compile(
-    r"^[pb]_model_model_(\d+)_.*(?:attn|qkv)"
-)
+_YOLO_DETECT_INDEX_RE = re.compile(r"^[pcb]_model_model_(\d+)_(?:cv2|cv3|dfl|m_|anchors|strides)(?:_|$)")
+_YOLO_ATTENTION_INDEX_RE = re.compile(r"^[pb]_model_model_(\d+)_.*(?:attn|qkv)")
 _YOLO_MODEL_PARAM_RE = re.compile(r"^[pb]_model_model_\d+_")
-_NAMED_MODEL_PARAM_RE = re.compile(
-    r"^[pb]_(?:backbone|neck|detect|detect_head|head|model)_"
-)
+_NAMED_MODEL_PARAM_RE = re.compile(r"^[pb]_(?:backbone|neck|detect|detect_head|head|model)_")
 
 _METADATA_ONLY_FACTORY_TARGETS = {
     torch.ops.aten._assert_tensor_metadata.default,
@@ -179,9 +173,7 @@ class JointBackwardAnnotationOptions:
     ``boundary_consumer_targets`` with its backward consumers.
     """
 
-    loss_path_targets: frozenset = field(
-        default_factory=lambda: frozenset(_LOSS_PATH_TARGETS)
-    )
+    loss_path_targets: frozenset = field(default_factory=lambda: frozenset(_LOSS_PATH_TARGETS))
     loss_path_text_tokens: tuple[str, ...] = _LOSS_PATH_TEXT_TOKENS
     boundary_consumer_targets: frozenset = field(
         default_factory=lambda: frozenset(_ANNOTATION_RULE_BOUNDARY_CONSUMER_TARGETS)
@@ -427,9 +419,7 @@ def _merge_quantization_annotation(
         if output_qspec is not None and existing.output_qspec is None:
             existing.output_qspec = output_qspec
             changed = True
-        existing.allow_implicit_sharing = (
-            existing.allow_implicit_sharing and allow_implicit_sharing
-        )
+        existing.allow_implicit_sharing = existing.allow_implicit_sharing and allow_implicit_sharing
         existing._annotated = True
         return changed
 
@@ -581,14 +571,10 @@ def get_symmetric_weight_qdq_config(*, per_channel: bool = True) -> Quantization
         dtype=torch.int8,
         quant_min=-127,
         quant_max=127,
-        qscheme=(
-            torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric
-        ),
+        qscheme=(torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric),
         ch_axis=0,
         is_dynamic=False,
-        observer_or_fake_quant_ctr=(
-            PerChannelMinMaxObserver if per_channel else MinMaxObserver
-        ).with_args(eps=2**-12),
+        observer_or_fake_quant_ctr=(PerChannelMinMaxObserver if per_channel else MinMaxObserver).with_args(eps=2**-12),
     )
     # _make_quantization_config also places the weight spec in the activation
     # slot; only `.weight` is ever read from this config, so that is inert.
@@ -614,11 +600,7 @@ def _is_silu_node(node: Node) -> bool:
 
 
 def _decomposed_silu_input(node: Node) -> Node | None:
-    if (
-        node.op != "call_function"
-        or node.target != torch.ops.aten.mul.Tensor
-        or len(node.args) < 2
-    ):
+    if node.op != "call_function" or node.target != torch.ops.aten.mul.Tensor or len(node.args) < 2:
         return None
     lhs, rhs = node.args[:2]
     if isinstance(lhs, Node) and _is_sigmoid_of(rhs, lhs):
@@ -670,8 +652,7 @@ def _node_contains_target(
         return False
     seen.add(node)
     return any(
-        _node_contains_target(arg, target, max_depth=max_depth - 1, seen=seen)
-        for arg in _iter_node_args(node.args)
+        _node_contains_target(arg, target, max_depth=max_depth - 1, seen=seen) for arg in _iter_node_args(node.args)
     )
 
 
@@ -725,9 +706,7 @@ def _forward_node_names(gm: GraphModule, loss_output_names: set[str]) -> set[str
     return names
 
 
-def _model_forward_node_names(
-    gm: GraphModule, user_output_names: set[str]
-) -> set[str]:
+def _model_forward_node_names(gm: GraphModule, user_output_names: set[str]) -> set[str]:
     by_name = {node.name: node for node in gm.graph.nodes}
     stack = [by_name[name] for name in user_output_names if name in by_name]
     seen: set[Node] = set()
@@ -741,9 +720,7 @@ def _model_forward_node_names(
     return {node.name for node in seen}
 
 
-def _clear_quantization_annotations(
-    gm: GraphModule, keep_fn: Callable[[Node], bool]
-) -> None:
+def _clear_quantization_annotations(gm: GraphModule, keep_fn: Callable[[Node], bool]) -> None:
     for node in gm.graph.nodes:
         if not keep_fn(node):
             node.meta.pop(Q_ANNOTATION_KEY, None)
@@ -804,12 +781,7 @@ def _node_match_strings(node: Node) -> dict[str, list[str]]:
         "module": module_paths,
         "type": module_types,
     }
-    fields["any"] = [
-        text
-        for values in fields.values()
-        for text in values
-        if text
-    ]
+    fields["any"] = [text for values in fields.values() for text in values if text]
     return fields
 
 
@@ -854,14 +826,9 @@ def _is_loss_path_related(
 ) -> bool:
     options = _resolve_annotation_options(options)
     related = _collect_related_nodes(nodes, max_depth=max_depth)
-    if loss_only_node_names is not None and any(
-        node.name in loss_only_node_names for node in related
-    ):
+    if loss_only_node_names is not None and any(node.name in loss_only_node_names for node in related):
         return True
-    if any(
-        node.op == "call_function" and node.target in options.loss_path_targets
-        for node in related
-    ):
+    if any(node.op == "call_function" and node.target in options.loss_path_targets for node in related):
         return True
     for node in related:
         if node.op != "placeholder":
@@ -882,28 +849,17 @@ def _is_attention_related(
     max_depth: int = 3,
 ) -> bool:
     related = _collect_related_nodes(nodes, max_depth=max_depth)
-    if any(
-        node.op == "call_function" and node.target in _ATTENTION_TARGETS
-        for node in related
-    ):
+    if any(node.op == "call_function" and node.target in _ATTENTION_TARGETS for node in related):
         return True
     texts = _lower_match_texts(related, max_depth=0)
     token_texts = _lower_match_texts(
         _collect_related_nodes(nodes, max_depth=min(max_depth, 4)),
         max_depth=0,
     )
-    if any(
-        token in text
-        for text in token_texts
-        for token in _ATTENTION_TEXT_TOKENS
-    ):
+    if any(token in text for text in token_texts for token in _ATTENTION_TEXT_TOKENS):
         return True
     attention_model_indices = attention_model_indices or set()
-    return any(
-        f"model_model_{index}_" in text
-        for text in texts
-        for index in attention_model_indices
-    )
+    return any(f"model_model_{index}_" in text for text in texts for index in attention_model_indices)
 
 
 def _is_detect_head_related(text: str, detect_head_indices: set[str]) -> bool:
@@ -913,9 +869,7 @@ def _is_detect_head_related(text: str, detect_head_indices: set[str]) -> bool:
 
 
 def _is_model_parameter_text(text: str) -> bool:
-    return bool(
-        _YOLO_MODEL_PARAM_RE.match(text) or _NAMED_MODEL_PARAM_RE.match(text)
-    )
+    return bool(_YOLO_MODEL_PARAM_RE.match(text) or _NAMED_MODEL_PARAM_RE.match(text))
 
 
 def _is_model_path_related(
@@ -957,9 +911,7 @@ def _annotation_rule_edge_decision(
         max_depth=4,
     ):
         return "skip_attention"
-    if any(
-        item.name in model_backward_node_names for item in (node, input_node, origin)
-    ):
+    if any(item.name in model_backward_node_names for item in (node, input_node, origin)):
         return "quantize"
     if not _is_model_path_related(
         related,
@@ -1085,11 +1037,7 @@ def _normalize_layerwise_edge_formats(section: object) -> dict[str, str]:
     forward_format = section.get("forward", default_format)
     backward_format = section.get("backward", default_format)
     for edge_kind in _LAYERWISE_EDGE_KINDS:
-        phase_format = (
-            forward_format
-            if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS
-            else backward_format
-        )
+        phase_format = forward_format if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS else backward_format
         if phase_format is not None:
             formats[edge_kind] = str(phase_format)
 
@@ -1107,9 +1055,7 @@ def _normalize_layerwise_edge_formats(section: object) -> dict[str, str]:
 
     for edge_kind, quant_format in formats.items():
         allowed_formats = (
-            _LAYERWISE_FORWARD_FORMATS
-            if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS
-            else _LAYERWISE_BACKWARD_FORMATS
+            _LAYERWISE_FORWARD_FORMATS if edge_kind in _LAYERWISE_FORWARD_EDGE_KINDS else _LAYERWISE_BACKWARD_FORMATS
         )
         if quant_format not in allowed_formats:
             raise ValueError(
@@ -1135,10 +1081,7 @@ class _LayerWiseQuantRule:
                 key = "module"
             if key not in {"name", "target", "module", "type", "any"}:
                 raise ValueError(f"unsupported layer quantization match key: {raw_key}")
-            patterns = [
-                re.compile(pattern)
-                for pattern in _as_string_list(raw_patterns)
-            ]
+            patterns = [re.compile(pattern) for pattern in _as_string_list(raw_patterns)]
             self.matchers[key] = patterns
         if not self.matchers:
             raise ValueError("layer quantization rule must contain at least one matcher")
@@ -1158,10 +1101,7 @@ class _LayerWiseQuantRule:
 
         for key, patterns in self.matchers.items():
             values = field_values[key]
-            if not all(
-                any(pattern.search(value) for value in values)
-                for pattern in patterns
-            ):
+            if not all(any(pattern.search(value) for value in values) for pattern in patterns):
                 return False
         return True
 
@@ -1173,17 +1113,11 @@ class _LayerWiseQuantFormatResolver:
     def __init__(self, config: dict[str, Any]) -> None:
         if not isinstance(config, dict):
             raise TypeError("layer quantization config must be a JSON object")
-        self.default_formats = _normalize_layerwise_edge_formats(
-            config.get("default", {})
-        )
+        self.default_formats = _normalize_layerwise_edge_formats(config.get("default", {}))
         rules = config.get("rules", [])
         if not isinstance(rules, list):
             raise TypeError("layer quantization config 'rules' must be a list")
-        self.rules = [
-            _LayerWiseQuantRule(index, rule)
-            for index, rule in enumerate(rules)
-            if isinstance(rule, dict)
-        ]
+        self.rules = [_LayerWiseQuantRule(index, rule) for index, rule in enumerate(rules) if isinstance(rule, dict)]
         if len(self.rules) != len(rules):
             raise TypeError("layer quantization rules must be objects")
         self._activation_qspecs = {
@@ -1226,10 +1160,15 @@ class _LayerWiseQuantFormatResolver:
             raise ValueError(f"unsupported layer quantization edge kind: {edge_kind}")
         quant_format = self.default_formats.get(edge_kind)
         matched_rule_name: str | None = None
-        match_depth = 1 if edge_kind in {
-            "backward_silu_input",
-            "backward_conv_input",
-        } else 3
+        match_depth = (
+            1
+            if edge_kind
+            in {
+                "backward_silu_input",
+                "backward_conv_input",
+            }
+            else 3
+        )
         for rule in self.rules:
             if not rule.matches(nodes, max_depth=match_depth):
                 continue
@@ -1243,9 +1182,7 @@ class _LayerWiseQuantFormatResolver:
         edge_counts = self.format_counts.setdefault(edge_kind, {})
         edge_counts[quant_format] = edge_counts.get(quant_format, 0) + 1
         if matched_rule_name is not None:
-            self.rule_counts[matched_rule_name] = (
-                self.rule_counts.get(matched_rule_name, 0) + 1
-            )
+            self.rule_counts[matched_rule_name] = self.rule_counts.get(matched_rule_name, 0) + 1
         return self._qspec_for_format(edge_kind, quant_format)
 
     def report(self) -> dict[str, Any]:
@@ -1279,14 +1216,9 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
     ) -> None:
         super().__init__()
         if backward_quantization_mode not in _BACKWARD_QUANTIZATION_MODES:
-            raise ValueError(
-                "backward_quantization_mode must be one of "
-                f"{sorted(_BACKWARD_QUANTIZATION_MODES)}"
-            )
+            raise ValueError(f"backward_quantization_mode must be one of {sorted(_BACKWARD_QUANTIZATION_MODES)}")
         self.activation_config = activation_config or get_affine_activation_qdq_config()
-        self.pre_silu_activation_config = (
-            pre_silu_activation_config or get_affine_activation_qdq_config()
-        )
+        self.pre_silu_activation_config = pre_silu_activation_config or get_affine_activation_qdq_config()
         self.gradient_config = gradient_config or get_symmetric_gradient_qdq_config()
         self.weight_config = weight_config or get_symmetric_weight_qdq_config()
         self.quantize_final_outputs = quantize_final_outputs
@@ -1295,16 +1227,13 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         self.annotate_silu_edges = annotate_silu_edges
         self.annotate_pre_silu_edges = annotate_pre_silu_edges
         self.silu_output_filter_fn = silu_output_filter_fn
-        self.forward_quantization_config = (
-            forward_quantization_config
-            or get_symmetric_quantization_config(is_per_channel=False)
+        self.forward_quantization_config = forward_quantization_config or get_symmetric_quantization_config(
+            is_per_channel=False
         )
         self.forward_filter_fn = forward_filter_fn
         self.annotation_options = annotation_options
         self.layer_quantization_resolver = (
-            _LayerWiseQuantFormatResolver(layer_quantization_config)
-            if layer_quantization_config is not None
-            else None
+            _LayerWiseQuantFormatResolver(layer_quantization_config) if layer_quantization_config is not None else None
         )
         self.loss_output_names: set[str] = set()
         self.user_output_names: set[str] = set()
@@ -1323,9 +1252,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             if spec.kind == OutputKind.USER_OUTPUT and hasattr(spec.arg, "name")
         }
         self.final_output_names = {
-            spec.arg.name
-            for spec in exported_program.graph_signature.output_specs
-            if hasattr(spec.arg, "name")
+            spec.arg.name for spec in exported_program.graph_signature.output_specs if hasattr(spec.arg, "name")
         }
 
     def transform_for_annotation(self, model: GraphModule) -> GraphModule:
@@ -1333,32 +1260,25 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
         return model
 
     def annotate(self, model: GraphModule) -> GraphModule:
-        user_forward_node_names = _model_forward_node_names(
-            model, self.user_output_names
-        )
-        loss_forward_node_names = _model_forward_node_names(
-            model, self.loss_output_names
-        )
+        user_forward_node_names = _model_forward_node_names(model, self.user_output_names)
+        loss_forward_node_names = _model_forward_node_names(model, self.loss_output_names)
         if self.use_xnnpack_forward_quantizer:
-            forward_node_names = user_forward_node_names or _forward_node_names(
-                model, self.loss_output_names
-            )
-            forward_quantizer = XNNPACKQuantizer().set_global(
-                self.forward_quantization_config
-            )
+            forward_node_names = user_forward_node_names or _forward_node_names(model, self.loss_output_names)
+            forward_quantizer = XNNPACKQuantizer().set_global(self.forward_quantization_config)
             forward_quantizer.set_filter_function(
-                lambda node: node.name in forward_node_names
-                and (
-                    self.forward_filter_fn is None or self.forward_filter_fn(node)
+                lambda node: (
+                    node.name in forward_node_names and (self.forward_filter_fn is None or self.forward_filter_fn(node))
                 )
             )
             model = forward_quantizer.annotate(model)
             if self.forward_filter_fn is not None:
                 _clear_quantization_annotations(
                     model,
-                    lambda node: node.name in forward_node_names
-                    and self.forward_filter_fn is not None
-                    and self.forward_filter_fn(node),
+                    lambda node: (
+                        node.name in forward_node_names
+                        and self.forward_filter_fn is not None
+                        and self.forward_filter_fn(node)
+                    ),
                 )
 
         if self.layer_quantization_resolver is not None:
@@ -1372,9 +1292,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             gradient_qspec=self.gradient_config.input_activation,
             weight_qspec=self.weight_config.weight,
             loss_output_names=self.loss_output_names,
-            final_output_names=self.final_output_names
-            if self.quantize_final_outputs
-            else set(),
+            final_output_names=self.final_output_names if self.quantize_final_outputs else set(),
             backward_quantization_mode=self.backward_quantization_mode,
             annotate_forward_compute_edges=not self.use_xnnpack_forward_quantizer,
             annotate_silu_edges=self.annotate_silu_edges,
@@ -1385,9 +1303,7 @@ class XNNPACKJointTrainingQuantizer(Quantizer):
             qspec_resolver=self.layer_quantization_resolver,
         )
         if self.layer_quantization_resolver is not None:
-            self.annotation_report["joint_qdq_layerwise_config"] = (
-                self.layer_quantization_resolver.report()
-            )
+            self.annotation_report["joint_qdq_layerwise_config"] = self.layer_quantization_resolver.report()
         return model
 
     def validate(self, model: GraphModule) -> None:
@@ -1414,10 +1330,7 @@ def annotate_joint_backward_qdq_edges(
     silu_output_filter_fn: Callable[[Node], bool] | None = None,
     phase_forward_node_names: set[str] | None = None,
     loss_only_node_names: set[str] | None = None,
-    qspec_resolver: Callable[
-        [str, QuantizationSpec, tuple[Node, ...]], QuantizationSpec
-    ]
-    | None = None,
+    qspec_resolver: Callable[[str, QuantizationSpec, tuple[Node, ...]], QuantizationSpec] | None = None,
 ) -> dict[str, Any]:
     def resolve_qspec(
         edge_kind: str,
@@ -1439,12 +1352,8 @@ def annotate_joint_backward_qdq_edges(
         pre_silu_sources, silu_outputs, silu_internal_sigmoids = set(), set(), set()
     producer_output_qspec_nodes = pre_silu_sources | silu_outputs
     annotation_rule_enabled = backward_quantization_mode == "annotation_rule"
-    detect_head_indices = (
-        _detect_head_model_indices(gm) if annotation_rule_enabled else set()
-    )
-    attention_model_indices = (
-        _attention_model_indices(gm) if annotation_rule_enabled else set()
-    )
+    detect_head_indices = _detect_head_model_indices(gm) if annotation_rule_enabled else set()
+    attention_model_indices = _attention_model_indices(gm) if annotation_rule_enabled else set()
     model_backward_node_names = (
         _annotation_rule_model_backward_node_names(
             gm,
@@ -1493,22 +1402,14 @@ def annotate_joint_backward_qdq_edges(
 
         output_qspec = None
         if node in pre_silu_sources and _is_float_tensor_node(node):
-            output_qspec = resolve_qspec(
-                "forward_pre_silu", pre_silu_activation_qspec, node
-            )
+            output_qspec = resolve_qspec("forward_pre_silu", pre_silu_activation_qspec, node)
         elif node in silu_outputs and _is_float_tensor_node(node):
-            output_qspec = resolve_qspec(
-                "forward_silu_output", activation_qspec, node
-            )
+            output_qspec = resolve_qspec("forward_silu_output", activation_qspec, node)
         elif node.name in final_output_names and _is_float_tensor_node(node):
             if in_backward:
-                output_qspec = resolve_qspec(
-                    "final_backward_output", gradient_qspec, node
-                )
+                output_qspec = resolve_qspec("final_backward_output", gradient_qspec, node)
             else:
-                output_qspec = resolve_qspec(
-                    "final_forward_output", activation_qspec, node
-                )
+                output_qspec = resolve_qspec("final_forward_output", activation_qspec, node)
         elif (
             annotation_rule_enabled
             and in_backward
@@ -1570,8 +1471,7 @@ def annotate_joint_backward_qdq_edges(
                 if in_backward:
                     origin = _origin_node(input_node)
                     if input_node.name in loss_output_names or (
-                        loss_only_node_names is not None
-                        and origin.name in loss_only_node_names
+                        loss_only_node_names is not None and origin.name in loss_only_node_names
                     ):
                         continue
                 if _is_metadata_only_factory_node(node):
@@ -1579,9 +1479,7 @@ def annotate_joint_backward_qdq_edges(
                 if not _is_quantizable_input_node(input_node):
                     continue
                 origin = _origin_node(input_node)
-                if _is_metadata_only_factory_node(
-                    input_node
-                ) or _is_metadata_only_factory_node(origin):
+                if _is_metadata_only_factory_node(input_node) or _is_metadata_only_factory_node(origin):
                     continue
                 if origin in producer_output_qspec_nodes:
                     annotation_rule_counts["reuse_producer_output_qspec"] += 1
@@ -1589,8 +1487,7 @@ def annotate_joint_backward_qdq_edges(
                 # Which qspec this edge would otherwise get; mirrors the
                 # three-way choice made further down.
                 saved_activation_edge = in_backward and (
-                    origin in forward_value_nodes
-                    or _is_user_activation_placeholder(origin)
+                    origin in forward_value_nodes or _is_user_activation_placeholder(origin)
                 )
                 if _is_parameter_weight_node(input_node):
                     candidate_qspec = weight_qspec
@@ -1607,9 +1504,7 @@ def annotate_joint_backward_qdq_edges(
                 # cat_17) then disagree once calibration sees enough samples to
                 # separate them.  Reuse the producer's qspec when the wire
                 # format matches.
-                if _qspec_interchangeable(
-                    _existing_output_qspec(origin), candidate_qspec
-                ):
+                if _qspec_interchangeable(_existing_output_qspec(origin), candidate_qspec):
                     annotation_rule_counts["reuse_producer_output_qspec"] += 1
                     producer_output_qspec_nodes.add(origin)
                     continue
@@ -1634,10 +1529,7 @@ def annotate_joint_backward_qdq_edges(
                     annotation_rule_counts["quantized_input_edges"] += 1
                 if _is_parameter_weight_node(input_node):
                     input_qspec_map[input_node] = weight_qspec
-                elif in_backward and (
-                    origin in forward_value_nodes
-                    or _is_user_activation_placeholder(origin)
-                ):
+                elif in_backward and (origin in forward_value_nodes or _is_user_activation_placeholder(origin)):
                     input_qspec_map[input_node] = resolve_qspec(
                         "backward_saved_activation",
                         activation_qspec,
@@ -1646,9 +1538,7 @@ def annotate_joint_backward_qdq_edges(
                         origin,
                     )
                 else:
-                    edge_kind = (
-                        "backward_gradient" if in_backward else "forward_activation"
-                    )
+                    edge_kind = "backward_gradient" if in_backward else "forward_activation"
                     input_qspec_map[input_node] = resolve_qspec(
                         edge_kind,
                         gradient_qspec if in_backward else activation_qspec,
@@ -1720,30 +1610,18 @@ def annotate_joint_backward_qdq_edges(
         "joint_qdq_silu_internal_sigmoids": len(silu_internal_sigmoids),
         "joint_qdq_conv_silu_backward_edges": conv_silu_backward_edges,
         "joint_qdq_annotation_rule_detect_head_indices": sorted(detect_head_indices),
-        "joint_qdq_annotation_rule_attention_indices": sorted(
-            attention_model_indices
-        ),
-        "joint_qdq_annotation_rule_model_backward_nodes": len(
-            model_backward_node_names
-        ),
+        "joint_qdq_annotation_rule_attention_indices": sorted(attention_model_indices),
+        "joint_qdq_annotation_rule_model_backward_nodes": len(model_backward_node_names),
         "joint_qdq_annotation_rule": annotation_rule_counts,
     }
 
 
 def _is_quantize_per_tensor_node(node: object) -> bool:
-    return (
-        isinstance(node, Node)
-        and node.op == "call_function"
-        and node.target == _QUANTIZE_PER_TENSOR
-    )
+    return isinstance(node, Node) and node.op == "call_function" and node.target == _QUANTIZE_PER_TENSOR
 
 
 def _is_dequantize_per_tensor_node(node: object) -> bool:
-    return (
-        isinstance(node, Node)
-        and node.op == "call_function"
-        and node.target == _DEQUANTIZE_PER_TENSOR
-    )
+    return isinstance(node, Node) and node.op == "call_function" and node.target == _DEQUANTIZE_PER_TENSOR
 
 
 def _quantize_source(node: Node) -> Node | None:
@@ -1837,30 +1715,20 @@ def _contains_sigmoid_of_alias(
         return False
     seen.add(node)
     return any(
-        _contains_sigmoid_of_alias(
-            arg, source, max_depth=max_depth - 1, seen=seen
-        )
+        _contains_sigmoid_of_alias(arg, source, max_depth=max_depth - 1, seen=seen)
         for arg in _iter_node_args(node.args)
     )
 
 
 def _is_converted_decomposed_silu_node(node: Node, quantize_node: Node) -> bool:
-    if (
-        node.op != "call_function"
-        or node.target != torch.ops.aten.mul.Tensor
-        or len(node.args) < 2
-    ):
+    if node.op != "call_function" or node.target != torch.ops.aten.mul.Tensor or len(node.args) < 2:
         return False
     qdq_source = _quantize_source(quantize_node)
     if qdq_source is None:
         return False
     lhs, rhs = node.args[:2]
-    return (
-        _is_alias_of(lhs, qdq_source)
-        and _contains_sigmoid_of_alias(rhs, qdq_source)
-    ) or (
-        _is_alias_of(rhs, qdq_source)
-        and _contains_sigmoid_of_alias(lhs, qdq_source)
+    return (_is_alias_of(lhs, qdq_source) and _contains_sigmoid_of_alias(rhs, qdq_source)) or (
+        _is_alias_of(rhs, qdq_source) and _contains_sigmoid_of_alias(lhs, qdq_source)
     )
 
 
@@ -1880,9 +1748,7 @@ def _contains_sigmoid_of_dequantize_from(
         return False
     seen.add(node)
     return any(
-        _contains_sigmoid_of_dequantize_from(
-            arg, quantize_node, max_depth=max_depth - 1, seen=seen
-        )
+        _contains_sigmoid_of_dequantize_from(arg, quantize_node, max_depth=max_depth - 1, seen=seen)
         for arg in _iter_node_args(node.args)
     )
 
@@ -1942,9 +1808,7 @@ def _insert_ste_mask(
     with gm.graph.inserting_before(insert_before):
         ge = gm.graph.call_function(torch.ops.aten.ge.Scalar, args=(source_node, lower))
         le = gm.graph.call_function(torch.ops.aten.le.Scalar, args=(source_node, upper))
-        mask_bool = gm.graph.call_function(
-            torch.ops.aten.logical_and.default, args=(ge, le)
-        )
+        mask_bool = gm.graph.call_function(torch.ops.aten.logical_and.default, args=(ge, le))
         mask = gm.graph.call_function(
             torch.ops.aten._to_copy.default,
             args=(mask_bool,),
@@ -1968,31 +1832,19 @@ def _find_converted_silu_qdq(gm: GraphModule) -> list[tuple[Node, Node, Node, No
             if _is_converted_decomposed_silu_node(candidate, pre_silu_quantize)
         ]
         for silu_node in silu_nodes:
-            qasym_candidates = [
-                user
-                for user in _direct_quantize_users(silu_node)
-                if _is_affine_qdq_quantize(user)
-            ]
+            qasym_candidates = [user for user in _direct_quantize_users(silu_node) if _is_affine_qdq_quantize(user)]
             for qasym_quantize in qasym_candidates:
-                matches.append(
-                    (pre_silu_source, pre_silu_quantize, silu_node, qasym_quantize)
-                )
+                matches.append((pre_silu_source, pre_silu_quantize, silu_node, qasym_quantize))
     return matches
 
 
-def _find_silu_backward_grads(
-    gm: GraphModule, pre_silu_quantize: Node
-) -> list[tuple[Node, Node]]:
+def _find_silu_backward_grads(gm: GraphModule, pre_silu_quantize: Node) -> list[tuple[Node, Node]]:
     candidates: list[tuple[Node, Node]] = []
     pre_silu_source = _quantize_source(pre_silu_quantize)
     if pre_silu_source is None:
         return candidates
     for node in gm.graph.nodes:
-        if (
-            node.op != "call_function"
-            or node.target != torch.ops.aten.mul.Tensor
-            or len(node.args) < 2
-        ):
+        if node.op != "call_function" or node.target != torch.ops.aten.mul.Tensor or len(node.args) < 2:
             continue
         node_args = [arg for arg in node.args[:2] if isinstance(arg, Node)]
         if any(
@@ -2055,9 +1907,7 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
 
         for silu_grad, gradient_input in silu_grad_matches:
             silu_grad_quantize_users = [
-                user
-                for user in _direct_quantize_users(silu_grad)
-                if _is_symmetric_qdq_quantize(user)
+                user for user in _direct_quantize_users(silu_grad) if _is_symmetric_qdq_quantize(user)
             ]
             conv_backward_users = [
                 user
@@ -2077,16 +1927,12 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
                 insert_before=silu_grad,
             )
             with gm.graph.inserting_before(silu_grad):
-                masked_gradient = gm.graph.call_function(
-                    torch.ops.aten.mul.Tensor, args=(gradient_input, qasym_mask)
-                )
+                masked_gradient = gm.graph.call_function(torch.ops.aten.mul.Tensor, args=(gradient_input, qasym_mask))
             if _replace_node_arg(silu_grad, gradient_input, masked_gradient):
                 qasym_masks += 1
 
             pre_silu_mask_insert_before = (
-                silu_grad_quantize_users[0]
-                if silu_grad_quantize_users
-                else conv_backward_users[0]
+                silu_grad_quantize_users[0] if silu_grad_quantize_users else conv_backward_users[0]
             )
             pre_silu_mask = _insert_ste_mask(
                 gm,
@@ -2095,9 +1941,7 @@ def insert_joint_qdq_ste_masks(gm: GraphModule) -> dict[str, int]:
                 insert_before=pre_silu_mask_insert_before,
             )
             with gm.graph.inserting_before(pre_silu_mask_insert_before):
-                masked_silu_grad = gm.graph.call_function(
-                    torch.ops.aten.mul.Tensor, args=(silu_grad, pre_silu_mask)
-                )
+                masked_silu_grad = gm.graph.call_function(torch.ops.aten.mul.Tensor, args=(silu_grad, pre_silu_mask))
             for quantize_user in silu_grad_quantize_users:
                 quantize_user.args = (masked_silu_grad, *quantize_user.args[1:])
             for conv_backward in conv_backward_users:
