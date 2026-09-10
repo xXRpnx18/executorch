@@ -166,7 +166,7 @@ def generate_memory_trace(
                 e["args"]["Memory ID"] = allocation.memory_id
                 e["args"]["fqn"] = f"{allocation.fqn}"
                 e["args"]["source"] = f"{allocation.file_and_line_num}"
-                e["args"]["bytes"] = allocation.size_bytes
+                e["args"]["bytes"] = int(allocation.size_bytes)
             start_time += allocation_size_kb
             trace_events.append(e)
         tid += 1
